@@ -43,12 +43,22 @@ Wait for explicit approval before making any API call.
   Blixt, Immaterial, Redoxion, Peter Robson, George Vives-Rouco
 - Never run dream cycle or Opus tasks without explicit approval
 
-## INBOX PROCESSING SKILL
+## INBOX PROCESSING SKILL (auto-scaling)
 - Always use ~/bin/skills/inbox-enrich/SKILL.md when processing inbox/ files
 - Never use gbrain default ingestion skills for email or meeting files
-- Trigger: any task involving inbox/ folder, email filing, or meeting note processing
-- Authoritative instructions: ~/bin/prompts/inbox-enrich.md (read fresh each run)
-- Daily 9 AM cron auto-runs this skill via Sonnet 4.6
+- Triggers: "process inbox", "drain inbox", "enrich inbox", "file inbox",
+  "clear inbox backlog", or any task touching ~/brain/inbox/*.md
+- Authoritative per-file rules: ~/bin/prompts/inbox-enrich.md (read fresh each run)
+- Auto-scaling orchestration lives in ~/bin/brain-run Phase 4:
+  0 files → exit clean
+  1-10 → single-pass (one claude invocation)
+  11-100 → parallel (batches of 10, max 10 concurrent subagents, first-3 canary)
+  101+ → cost-guarded confirm (refuse if estimate >$30 without --force-large)
+- Skip filter: frontmatter tag `skip-enrich` excludes a file from runs
+- Watermark: `enriched: YYYY-MM-DD` in frontmatter marks a file as done
+- --force-large implies --force-inbox; both bypass non-interactive refusals
+- Daily 9 AM cron stays single-pass (cron does ≤10/day)
+- Run summary written to ~/brain/.tasks/inbox-run-YYYY-MM-DD-HHMM.md
 
 ## SUNDAY BRIEFING SKILL
 - Always use ~/bin/skills/sunday-briefing/SKILL.md when generating Sunday or weekly briefings

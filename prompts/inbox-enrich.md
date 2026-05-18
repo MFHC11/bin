@@ -17,11 +17,32 @@ ways, and add timeline entries where the inbox file documents a dated event.
 
 ## Process
 
-### Step 1 — Enumerate
+### Step 0 — Mode detection
+
+You are running in **one of two modes**. Detect which from your input:
+
+**Subagent mode** — your input contains a line of the form:
+```
+SUBAGENT_FILES: <absolute-path-1> <absolute-path-2> ... <absolute-path-N>
+```
+If present, the wrapper has already done the enumeration, filtering, and
+cost-guard checks. **Skip Step 1 entirely** and process EXACTLY the listed
+files in the order given. The per-subagent cap is 10 files and the 30-turn
+ceiling still applies. Do not look for additional unprocessed files.
+
+**Single-pass mode** — no `SUBAGENT_FILES:` directive. The wrapper has
+confirmed the unprocessed count is ≤ 10. Run Step 1 enumeration (oldest 10
+unprocessed) and process inline.
+
+After Step 0, continue to Step 2 (subagent mode) or Step 1 (single-pass).
+
+### Step 1 — Enumerate (single-pass mode only)
 Run `Bash: ls ~/brain/inbox/*.md` then filter out:
 - `README.md`
 - any file whose frontmatter contains `enriched:` (already processed in a
   previous run — quick check: `grep -L '^enriched:' inbox/*.md`)
+- any file whose frontmatter contains a `skip-enrich` tag (Marcus has
+  flagged these as deliberately excluded from runs)
 
 Order the remaining set by filename ascending — files are date-prefixed, so
 this gives chronological order. Process up to **10 files per run** (oldest
@@ -32,14 +53,12 @@ lookup + edit/write), and the 30-turn ceiling is hard.
 A handy one-liner for the oldest-10-unprocessed:
 ```bash
 ls ~/brain/inbox/*.md | grep -v '/README\.md$' | \
-  while read f; do grep -q '^enriched:' "$f" || echo "$f"; done | \
-  sort | head -10
+  while read f; do
+    grep -q '^enriched:' "$f" && continue
+    grep -q 'skip-enrich' "$f" && continue
+    echo "$f"
+  done | sort | head -10
 ```
-
-If you are dispatched as a subagent with an explicit file list in your
-prompt, skip enumeration and process EXACTLY those files in the order
-given. The per-run cap and turn ceiling still apply, unless the parent
-dispatch raises them explicitly.
 
 ### Step 2 — Per-file routing
 For each inbox file in turn:
@@ -243,3 +262,5 @@ Remaining in inbox/:    <N>   (will be picked up next run)
   summary. Do not advance any watermark; there isn't one for this phase.
 - **Do not run git, do not commit, do not push.** The wrapper handles
   commit + sync after you exit.
+- **In subagent mode, do not enumerate.** Trust the file list from your
+  parent wrapper. Do not look for additional unprocessed files.

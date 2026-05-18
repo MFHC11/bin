@@ -1,18 +1,19 @@
 ---
 name: inbox-enrich
 description: >
-  Process new captures in ~/brain/inbox/ — route meeting recaps to meetings/,
-  extract entities, stub missing people + company pages (capped), append
-  compiled-truth bullets under Open Threads / Recent Activity, add Timeline
-  entries with citations, and rewrite plain-text mentions into wikilinks.
-  Triggered by any task involving inbox/ files, email filing, meeting note
-  processing, or the daily 9 AM ingestion cron. NEVER substitute a gbrain
-  default ingestion skill (data-research, ingest, meeting-ingestion) for
-  this workflow — they have different filing rules and citation patterns.
+  Auto-scaling inbox processor — single-pass for 1-10 unprocessed files,
+  parallel subagent dispatch for 11-100, cost-guarded confirm for 100+.
+  Routes meeting recaps to meetings/, extracts entities, stubs missing
+  people + company pages (capped), appends compiled-truth bullets, adds
+  Timeline entries with citations, and rewrites plain-text mentions into
+  wikilinks. The brain-run Phase 4 wrapper implements enumeration,
+  routing, and subagent dispatch; this SKILL.md is the contract.
 triggers:
   - "process inbox"
+  - "drain inbox"
   - "enrich inbox"
   - "file inbox"
+  - "clear inbox backlog"
   - "inbox processing"
   - "daily inbox"
   - "9 AM enrichment"
@@ -26,75 +27,138 @@ writes_to:
   - people/
   - companies/
   - deals/
-  - inbox/ (wikilink rewrites only — never delete)
+  - inbox/ (wikilink rewrites + enriched: watermark — never delete)
+  - .tasks/ (run summary)
 ---
 
-# Inbox Enrich Skill
+# Inbox Enrich Skill (auto-scaling)
+
+## What this skill does
+
+The skill processes inbox/ captures into structured second-brain content:
+file moves, entity stubs, compiled-truth appends, timeline entries, and
+two-way backlinks. The behaviour **scales automatically with backlog size** —
+the orchestrator dispatches parallel subagents when the queue is deep.
 
 ## Authoritative instruction set
 
-The full, line-by-line instructions for this skill live at:
+Per-file enrichment rules live at `~/bin/prompts/inbox-enrich.md` — that
+file is what each subagent (or the single-pass agent) reads. Auto-scaling
+orchestration is implemented in `~/bin/brain-run` Phase 4. The tests in
+`~/bin/lib/brain-run-tests-phase4.zsh` define the contract.
 
-```
-~/bin/prompts/inbox-enrich.md
-```
+**Always read the prompt file fresh** at task start.
 
-That file IS the skill. This SKILL.md exists so the brain agent can
-auto-discover the prompt and route to it. **Always read the prompt file
-fresh at task start** — it's edited periodically and this summary may drift.
+## Auto-scaling routing
 
-## When to trigger
+The wrapper enumerates unprocessed files first, then routes by count:
 
-- Any explicit user ask: "process inbox", "enrich inbox", "file inbox",
-  "run inbox enrich", "do today's inbox", "process today's emails".
-- Implicit triggers: a task that involves files inside `~/brain/inbox/`
-  (filing emails, processing meeting notes that landed there, cleaning
-  up after a Gmail collector run).
-- The daily 9 AM cron's enrichment phase (`~/bin/brain-daily-9am.sh`).
+| Count | Mode | Behaviour |
+|---|---|---|
+| 0 | exit | Log "inbox empty"; end_phase succeeded. No claude invocations. |
+| 1-10 | single-pass | One `claude --print` invocation processes all of them inline. (Original behaviour.) |
+| 11-100 | parallel | Split into batches of 10 (oldest first); spawn up to 10 concurrent subagents; queue excess. |
+| 101+ | cost-guard | Estimate `count × $0.15`. Require explicit confirmation or `--force-large`. Refuse if estimate >$30 without `--force-large`. |
 
-## When NOT to trigger
+### "Unprocessed" definition
 
-- "Aggressive compiled-truth rewrites" — this skill APPENDS only.
-  Full rewrites are a separate manual workflow run with explicit
-  human approval (we ran one on 2026-05-13 across 21 top entities).
-- Granola transcript imports — those land directly in
-  `meetings/granola/` and don't go through `inbox/`.
-- Calendar daily files — those live under `daily/calendar/` and
-  have their own structure.
+A file in `~/brain/inbox/*.md` is unprocessed iff ALL hold:
 
-## Rules summary (canonical version is in the prompt file)
+- Filename is not `README.md`
+- Frontmatter has no `enriched: YYYY-MM-DD` line
+- Frontmatter has no `skip-enrich` tag
+
+### Cost guards
+
+- **Estimate**: `count × $0.15 average` (Sonnet baseline). Logged before the run.
+- **Estimate >$10**: Show the estimate; require explicit confirm (interactive)
+  or `--force-inbox` flag (cron / non-interactive).
+- **Estimate >$30**: Refuse to run unless `--force-large` flag passed.
+  `--force-large` implies `--force-inbox`.
+- **Actual cost**: Each subagent's `total_cost_usd` from its JSON output is
+  recorded; rolled up into the run summary.
+
+## Parallel mode behaviour
+
+When count > 10:
+
+1. Enumerate; sort by filename ascending (oldest first).
+2. Split into batches of 10. Final batch may be shorter.
+3. Spawn up to **10 concurrent** `claude --print` subagents.
+   - Each subagent receives the standard prompt PLUS a `SUBAGENT_FILES:`
+     directive listing exactly its batch.
+   - Flags: `--max-turns 30 --model claude-sonnet-4-6 --permission-mode bypassPermissions --output-format json`.
+   - Output JSON to `phase-4.batch-<N>.output.json`.
+4. **Mid-run gate**: when `n_batches > 3`, the first wave is capped at 3
+   batches (canary). After they complete, inspect their exit codes.
+   If ANY failed (and not just max-turns), abort the run — queue the
+   failed batches for split-in-half retry, but do not launch the
+   remaining `n_batches - 3` batches.
+5. **Failed batch retry**: a failed batch is retried ONCE with
+   **split-in-half** (5 + 5 files). If either half fails again, those
+   files are listed in the summary's failed-files section.
+6. After all batches complete, the wrapper commits each successful batch
+   (commit is handled by the brain-run wrapper, not by the agent).
+
+## Per-file enrichment rules (unchanged)
+
+See `~/bin/prompts/inbox-enrich.md` Steps 1-9. Invariants:
 
 | Rule | Detail |
 |---|---|
-| **Process cap** | Up to 10 inbox files per run, oldest first. |
-| **Routing** | Meeting recaps (real recap, no email metadata, no `email-` in filename) → `meetings/`. Emails + docs stay in `inbox/` for the wikilink rewrite pass. |
-| **Entity extraction** | People + organisations from `### Contacts` / `### Mentioned organisations` sections; fall back to inferred prose mentions. |
-| **Stub creation** | Use `mcp__gbrain__search` to find existing pages first; only stub when no match. Cap: ≤50 people, ≤25 companies per run. |
-| **Skip filters** | Role addresses (`marketing@`, `info@`, etc.), common-provider domains (`gmail.com`, `outlook.com`, etc.), ERV internal (`@erv.io`). |
-| **Compiled-truth** | **APPEND ONLY** to `## Open Threads` / `## Recent Activity` sections. NEVER replace existing content. Every appended line ends with `[Source: [[inbox/<filename-no-ext>]]]`. |
-| **Timeline** | One line per inbox file per relevant target: `- YYYY-MM-DD: <event> [Source: [[inbox/<filename-no-ext>]]]`. Skip stubs. |
-| **Wikilinks** | Rewrite plain-text mentions in the inbox file → `[[Display Name]]`. First occurrence only. Skip code blocks, frontmatter, existing `[[…]]` / `[Source: …]`. |
-| **Hard rules** | Never delete inbox files (only `mv` meetings out). Never replace content (append only). Never invent facts. 30-turn ceiling — write what you have and print the partial summary. Do not commit (wrapper handles git). |
+| Per-subagent cap | ≤ 10 files. |
+| Routing | Meeting recaps (strict 3-test) → `meetings/`. Emails + docs stay in `inbox/`. |
+| Stub creation | `mcp__gbrain__search` first; cap 50 people / 25 companies per subagent. |
+| Compiled-truth | Append-only with `[Source: [[inbox/...]]]` citations. |
+| Timeline | One line per file per target with citation. |
+| Wikilinks | First-occurrence-only; skip code blocks and frontmatter. |
+| Watermark | `enriched: YYYY-MM-DD` in frontmatter on every processed file. |
 
-## Conflict resolution with gbrain default skills
+## Output
 
-The gbrain repo ships `skills/data-research/SKILL.md`, `skills/ingest/SKILL.md`,
-`skills/meeting-ingestion/SKILL.md`, etc. Those have **different** filing rules,
-citation formats, and entity-creation thresholds. Per `~/.claude/CLAUDE.md`,
-`inbox-enrich` wins for anything touching `~/brain/inbox/` — do not chain into
-or substitute the gbrain defaults.
+After the run, the wrapper writes:
+
+```
+~/brain/.tasks/inbox-run-YYYY-MM-DD-HHMM.md
+```
+
+Contents:
+- Files unprocessed at start
+- Mode chosen (single-pass / parallel)
+- Batches executed
+- Total cost (sum of per-batch `total_cost_usd`)
+- Status (OK / PARTIAL)
+- Per-batch rc + cost lines
+
+A console summary is also printed (the same final block from the
+original Step 9 of the prompt).
+
+## Failure handling
+
+| Scenario | Behaviour |
+|---|---|
+| 0 unprocessed | Exit clean; log "inbox empty". |
+| Subagent max-turns | Treated as partial success; only files with watermark count as done. |
+| Subagent rc != 0 (non max-turns) | Log batch; retry once with split-in-half. |
+| ≥1 failure in first-3 canary | Abort run; remaining batches NOT launched. |
+| Estimate >$10, no `--force-inbox` (non-interactive) | Refuse. |
+| Estimate >$30, no `--force-large` | Refuse. |
 
 ## Invocation patterns
 
-**Manual (interactive Claude Code session):**
-> "Process today's inbox" — agent reads `~/bin/prompts/inbox-enrich.md` and
-> executes against current inbox state.
+**Manual**: "process inbox", "drain inbox", "clear inbox backlog" → runs
+`brain-run --weekly --no-mail --no-granola` (or equivalent inbox-only
+mode). Auto-scaling applies.
 
-**Cron (9 AM daily):**
-```bash
-# ~/bin/brain-daily-9am.sh submits this to the gbrain supervisor's shell handler
-claude --print --model sonnet < ~/bin/prompts/inbox-enrich.md
-```
+**Daily 9 AM cron**: `~/bin/brain-daily-9am.sh` continues to call
+`claude --print < ~/bin/prompts/inbox-enrich.md` directly. Single-pass
+(≤10 files) — the cron is a daily drip, not a backlog clearer.
 
-The cron path uses Sonnet 4.6 for cost containment (~$0.10–0.50/day).
-Manual passes can use Opus per the tiered model rule in `CLAUDE.md`.
+**Full sweep**: `brain-run --weekly --force-large` — bypasses both cost
+guards (force-large implies force-inbox).
+
+## Conflict resolution
+
+The gbrain repo ships default skills (data-research, ingest,
+meeting-ingestion). Per `~/.claude/CLAUDE.md`, **inbox-enrich wins** for
+anything in `~/brain/inbox/`. Do not chain into or substitute the defaults.
