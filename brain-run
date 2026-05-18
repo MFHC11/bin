@@ -49,6 +49,8 @@ typeset -g YES_DREAM=0
 typeset -g NO_MAIL=0
 typeset -g NO_ENRICH=0
 typeset -g NO_GRANOLA=0
+typeset -g FORCE_INBOX=0
+typeset -g FORCE_LARGE=0
 typeset -g NO_DREAM_MECH=0
 typeset -g NO_PUSH=0
 typeset -g RESUME=0
@@ -118,6 +120,8 @@ FLAGS:
   --no-granola      Skip Phase 2.
   --no-dream-mech   Skip Phase 5 (gbrain dream).
   --no-push         Skip Phase 7.
+  --force-inbox     Bypass the \$10 cost-confirm in Phase 4 (non-interactive).
+  --force-large     Bypass the \$30 cost-refuse in Phase 4 (implies --force-inbox).
   --resume          Resume last incomplete run.
   --dry-run         Print plan; don't execute.
   --run-id=ID       Override RUN_ID (test harness).
@@ -148,6 +152,8 @@ parse_args() {
       --no-granola)   NO_GRANOLA=1 ;;
       --no-dream-mech) NO_DREAM_MECH=1 ;;
       --no-push)      NO_PUSH=1 ;;
+      --force-inbox)  FORCE_INBOX=1 ;;
+      --force-large)  FORCE_LARGE=1; FORCE_INBOX=1 ;;
       --resume)       RESUME=1 ;;
       --dry-run)      DRY_RUN=1 ;;
       --run-id=*)     RUN_ID="${arg#--run-id=}" ;;
@@ -585,22 +591,24 @@ PYEOF
   return $rc
 }
 
-# ─── Phase 4: Inbox & enrich (Sonnet) ────────────────────────────────────────
-# Headless claude --print invocation against ~/bin/prompts/inbox-enrich.md.
-# Reads every file in inbox/, classifies, routes meeting-typed files to
-# meetings/, enriches existing people/companies/deals/projects pages with
-# new info + timeline entries + source citations, creates stubs for missing
-# entities, and wires two-way wikilinks. No external watermark — inbox files
-# themselves are the unit of work; what's left in inbox/ at the end gets
-# picked up on the next run.
+# ─── Phase 4: Inbox & enrich (auto-scaling) ──────────────────────────────────
+# Enumerates unprocessed inbox files (no `enriched:` watermark, no
+# `skip-enrich` tag), routes by count, dispatches subagents in parallel
+# for >10 with up to 10 concurrent, applies cost guards, and writes a
+# run summary to .tasks/inbox-run-...md.
+#
+# Routing:
+#   0 unprocessed   → exit clean (no claude invocation)
+#   1-10            → single-pass (original behaviour)
+#   11-100          → parallel: batches of 10, first-3 canary
+#   101+            → cost-guarded confirm (--force-large above $30; --force-inbox above $10)
+#
+# Subagent dispatch: each subagent reads $PROMPT_INBOX with a
+# SUBAGENT_FILES: <abs paths…> directive appended. The prompt's Step 0
+# detects subagent mode and processes only those files.
 phase_4_inbox_enrich() {
-  # Skipped under --quick. Same pattern as Phase 3 — don't begin_phase so
-  # phase-4.state stays absent.
-  if [ "$MODE" = "quick" ]; then
-    return 0
-  fi
-
-  print_phase_header 4 "Inbox & enrich ($MODEL_SONNET, max 30 turns)"
+  if [ "$MODE" = "quick" ]; then return 0; fi
+  print_phase_header 4 "Inbox & enrich ($MODEL_SONNET, auto-scaling)"
   begin_phase 4
 
   if [ "$NO_ENRICH" = "1" ]; then
@@ -608,74 +616,144 @@ phase_4_inbox_enrich() {
     end_phase 4 skipped "--no-enrich"
     return 0
   fi
-
   if [ ! -f "$PROMPT_INBOX" ]; then
     log "   ${_C_RED}✗${_C_RESET} prompt file missing: $PROMPT_INBOX"
     end_phase 4 failed
     return 1
   fi
-
   if [ ! -x "$CLAUDE_BIN" ]; then
     log "   ${_C_RED}✗${_C_RESET} claude CLI not executable: $CLAUDE_BIN"
     end_phase 4 failed
     return 1
   fi
 
-  # Snapshot inbox count before run so we can report what got processed.
+  local -a unprocessed
+  unprocessed=( ${(f)"$(_phase_4_enumerate_unprocessed)"} )
+  local n=${#unprocessed[@]}
+  [ "$n" -eq 1 ] && [ -z "${unprocessed[1]}" ] && { unprocessed=(); n=0; }
+
   local inbox_before
   inbox_before=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | wc -l | tr -d ' ')
-  log "   ${_C_DIM}▸${_C_RESET} inbox files before: $inbox_before"
+  log "   ${_C_DIM}▸${_C_RESET} inbox files before: $inbox_before (unprocessed: $n)"
 
-  # Pre-call estimate. Inbox enrichment processes up to 25 files per run
-  # with up to 30 turns of Sonnet; cost similar to Phase 3.
-  record_cost_estimate 4 "$MODEL_SONNET" "2.00"
-  log "   ${_C_DIM}▸${_C_RESET} pre-call estimate: \$2.00 (range \$1.00–3.00)"
+  # Route: empty
+  if [ "$n" -eq 0 ]; then
+    log "   ${_C_GREEN}✓${_C_RESET} inbox empty (no unprocessed files)"
+    record_cost_estimate 4 "$MODEL_SONNET" "0.00"
+    record_cost_actual   4 "$MODEL_SONNET" "0.00"
+    echo "0" > "$RUN_DIR/phase-4.metric.processed"
+    end_phase 4 succeeded
+    return 0
+  fi
 
-  _phase_4_run_agent
-  local rc=$?
-
-  if [ "$rc" -ne 0 ]; then
-    log "   ${_C_RED}✗${_C_RESET} agent exit $rc (see phase-4.log)"
+  # Cost guard
+  if ! _phase_4_cost_guard "$n"; then
+    log "   ${_C_RED}✗${_C_RESET} cost guard refused the run"
     end_phase 4 failed
     return 1
+  fi
+
+  local est
+  est=$(printf '%.2f' "$(echo "$n * 0.15" | bc -l)")
+  record_cost_estimate 4 "$MODEL_SONNET" "$est"
+  log "   ${_C_DIM}▸${_C_RESET} pre-call estimate: \$$est ($n × \$0.15)"
+
+  local rc=0
+  if [ "$n" -le 10 ]; then
+    log "   ${_C_DIM}▸${_C_RESET} single-pass mode"
+    _phase_4_run_batch "single" ""
+    rc=$?
+  else
+    log "   ${_C_DIM}▸${_C_RESET} parallel mode"
+    _phase_4_dispatch_parallel "${unprocessed[@]}"
+    rc=$?
   fi
 
   local inbox_after
   inbox_after=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | wc -l | tr -d ' ')
   local processed=$((inbox_before - inbox_after))
   echo "$processed" > "$RUN_DIR/phase-4.metric.processed"
-  log "   ${_C_GREEN}✓${_C_RESET} inbox files after: $inbox_after (delta: $processed)"
+  log "   ${_C_GREEN}✓${_C_RESET} inbox files after: $inbox_after (delta moved-out: $processed)"
 
+  _phase_4_write_summary "$n" "$rc"
+
+  if [ "$rc" -ne 0 ]; then
+    end_phase 4 failed
+    return 1
+  fi
   end_phase 4 succeeded
 }
 
-_phase_4_run_agent() {
+# List unprocessed inbox file paths, oldest first.
+# Excludes README.md, files with `enriched:` frontmatter, files tagged `skip-enrich`.
+_phase_4_enumerate_unprocessed() {
+  local inbox="$BRAIN_DIR/inbox"
+  [ -d "$inbox" ] || return 0
+  local f
+  for f in "$inbox"/*.md(N); do
+    [ "$(basename "$f")" = "README.md" ] && continue
+    grep -q '^enriched:' "$f" 2>/dev/null && continue
+    grep -q 'skip-enrich' "$f" 2>/dev/null && continue
+    printf '%s\n' "$f"
+  done | sort
+}
+
+# Cost guard. Refuses with logs if estimate exceeds thresholds without
+# the appropriate --force flag. --force-large implies --force-inbox.
+_phase_4_cost_guard() {
+  local n="$1"
+  local est
+  est=$(printf '%.2f' "$(echo "$n * 0.15" | bc -l)")
+
+  if (( $(echo "$est > 30" | bc -l) )); then
+    if [ "$FORCE_LARGE" != "1" ]; then
+      log "   ${_C_RED}✗${_C_RESET} cost guard: estimate \$$est exceeds \$30 — pass --force-large"
+      return 1
+    fi
+    log "   ${_C_YELLOW}!${_C_RESET} cost guard: --force-large bypassing \$30 ceiling (est \$$est)"
+  fi
+
+  if (( $(echo "$est > 10" | bc -l) )); then
+    if [ -t 0 ] && [ "$FORCE_INBOX" != "1" ]; then
+      printf "   estimate is \$%s (%d × \$0.15). proceed? [y/N] " "$est" "$n"
+      local reply
+      read -r reply
+      [[ "$reply" =~ ^[Yy] ]] || { log "   user declined"; return 1; }
+    elif [ "$FORCE_INBOX" != "1" ]; then
+      log "   ${_C_RED}✗${_C_RESET} cost guard: estimate \$$est exceeds \$10 in non-interactive mode — pass --force-inbox"
+      return 1
+    else
+      log "   ${_C_YELLOW}!${_C_RESET} cost guard: --force-inbox bypassing \$10 confirm (est \$$est)"
+    fi
+  fi
+  return 0
+}
+
+# Run a single subagent batch.
+# Args: label (string), files (space-separated paths; empty for single-pass).
+_phase_4_run_batch() {
+  local label="$1" files="$2"
   local prompt_body
   prompt_body=$(<"$PROMPT_INBOX")
-  local output_json="$RUN_DIR/phase-4.output.json"
-  local agent_log="$RUN_DIR/phase-4.log"
+  if [ -n "$files" ]; then
+    prompt_body+="
 
-  log "   ${_C_DIM}▸${_C_RESET} running headless agent ($MODEL_SONNET)..."
+SUBAGENT_FILES: $files"
+  fi
+
+  local output_json="$RUN_DIR/phase-4.batch-${label}.output.json"
+  local agent_log="$RUN_DIR/phase-4.batch-${label}.log"
 
   "$CLAUDE_BIN" \
     --model "$MODEL_SONNET" \
     --max-turns 30 \
     --allowedTools "$TOOLS_INBOX" \
     --output-format json \
+    --permission-mode bypassPermissions \
     --print "$prompt_body" \
     > "$output_json" 2> "$agent_log"
   local rc=$?
 
-  # Surface agent stderr in the run log for visibility
-  if [ -s "$agent_log" ]; then
-    cat "$agent_log" >> "$RUN_LOG" 2>/dev/null || true
-  fi
-
-  # Extract cost + terminal_reason from claude's --output-format json.
-  # terminal_reason="max_turns" is a bounded-budget stop, not a crash —
-  # the agent did real work up to the turn cap. We treat that as partial
-  # success (rc forced to 0) so subsequent runs continue from the
-  # remaining inbox files instead of repeatedly retrying a failing phase.
   local cost="0" terminal_reason=""
   if [ -s "$output_json" ]; then
     local parsed
@@ -690,19 +768,134 @@ PYEOF
 )
     cost="${parsed%|*}"
     terminal_reason="${parsed#*|}"
-    record_cost_actual 4 "$MODEL_SONNET" "${cost:-0}"
-    log "   ${_C_GREEN}✓${_C_RESET} actual cost: \$$cost"
-  else
-    log "   ${_C_YELLOW}!${_C_RESET} no JSON output captured; cost not recorded"
-    record_cost_actual 4 "$MODEL_SONNET" "0"
   fi
+  echo "${cost:-0}" > "$RUN_DIR/phase-4.batch-${label}.cost"
+  echo "$rc" > "$RUN_DIR/phase-4.batch-${label}.rc"
 
   if [ "$rc" -ne 0 ] && [ "$terminal_reason" = "max_turns" ]; then
-    log "   ${_C_YELLOW}!${_C_RESET} agent hit max-turns budget (work bounded; next run continues)"
+    log "   ${_C_YELLOW}!${_C_RESET} batch $label hit max-turns budget (partial)"
     return 0
   fi
-
   return $rc
+}
+
+# Parallel dispatch with concurrency cap, first-3 canary, and split-in-half retry.
+_phase_4_dispatch_parallel() {
+  local -a files=("$@")
+  local n_files=${#files[@]}
+  local n_batches=$(( (n_files + 9) / 10 ))
+  local max_concurrent=10
+
+  local -a batches
+  local i
+  for (( i=1; i<=n_batches; i++ )); do
+    local start=$(( (i - 1) * 10 + 1 ))
+    local cnt=10
+    [ $((start + cnt - 1)) -gt $n_files ] && cnt=$((n_files - start + 1))
+    local slice=( "${files[@]:$((start - 1)):$cnt}" )
+    batches[$i]="${slice[*]}"
+  done
+
+  log "   ${_C_DIM}▸${_C_RESET} $n_files file(s) → $n_batches batch(es), $max_concurrent concurrent max"
+
+  local wave_start=1
+  while [ $wave_start -le $n_batches ]; do
+    local wave_size=$max_concurrent
+    if [ $wave_start -eq 1 ] && [ $n_batches -gt 3 ]; then
+      wave_size=3
+    fi
+    local wave_end=$((wave_start + wave_size - 1))
+    [ $wave_end -gt $n_batches ] && wave_end=$n_batches
+
+    local -a wave_pids wave_indices
+    wave_pids=(); wave_indices=()
+    for (( i=wave_start; i<=wave_end; i++ )); do
+      _phase_4_run_batch "$i" "${batches[$i]}" &
+      wave_pids+=( $! )
+      wave_indices+=( $i )
+    done
+    local pid
+    for pid in "${wave_pids[@]}"; do wait $pid; done
+
+    local -a wave_failures
+    wave_failures=()
+    for i in "${wave_indices[@]}"; do
+      local rc_file="$RUN_DIR/phase-4.batch-${i}.rc"
+      if [ -s "$rc_file" ]; then
+        local rc_val=$(<"$rc_file")
+        [ "$rc_val" -ne 0 ] && wave_failures+=( $i )
+      fi
+    done
+
+    # Canary abort: first wave + >3 batches total + any failure → abort remaining
+    if [ $wave_start -eq 1 ] && [ $n_batches -gt 3 ] && [ ${#wave_failures[@]} -gt 0 ]; then
+      log "   ${_C_RED}✗${_C_RESET} first-3 canary: ${#wave_failures[@]} failed — aborting remaining $((n_batches - 3)) batch(es)"
+      for i in "${wave_failures[@]}"; do
+        _phase_4_retry_split "$i" "${batches[$i]}"
+      done
+      return 1
+    fi
+
+    # Retry failures in this wave (split-in-half)
+    for i in "${wave_failures[@]}"; do
+      _phase_4_retry_split "$i" "${batches[$i]}"
+    done
+
+    wave_start=$((wave_end + 1))
+  done
+  return 0
+}
+
+# Retry a failed batch by splitting its file list in half (one-shot).
+_phase_4_retry_split() {
+  local orig="$1" orig_files="$2"
+  log "   ${_C_YELLOW}!${_C_RESET} split-in-half retry for batch $orig"
+  local -a flist
+  flist=( ${=orig_files} )
+  local n=${#flist[@]}
+  local half=$(( (n + 1) / 2 ))
+  local first_half="${flist[@]:0:$half}"
+  local second_half="${flist[@]:$half}"
+  _phase_4_run_batch "${orig}a" "$first_half"
+  _phase_4_run_batch "${orig}b" "$second_half"
+}
+
+# Write summary to ~/brain/.tasks/inbox-run-YYYY-MM-DD-HHMM.md
+_phase_4_write_summary() {
+  local total="$1" rc="$2"
+  local stamp
+  stamp=$(date '+%Y-%m-%d-%H%M')
+  local summary="$REPORT_DIR/inbox-run-${stamp}.md"
+  mkdir -p "$REPORT_DIR"
+
+  local total_cost=0 batch_count=0
+  local cf
+  for cf in "$RUN_DIR"/phase-4.batch-*.cost(N); do
+    local c=$(<"$cf")
+    total_cost=$(echo "$total_cost + $c" | bc -l)
+    batch_count=$((batch_count + 1))
+  done
+  record_cost_actual 4 "$MODEL_SONNET" "$(printf '%.4f' "$total_cost")"
+
+  {
+    echo "# Inbox run — $stamp"
+    echo
+    echo "- Files unprocessed at start: $total"
+    echo "- Mode: $([ "$total" -le 10 ] && echo single-pass || echo parallel)"
+    echo "- Batches executed: $batch_count"
+    echo "- Total cost: \$$(printf '%.4f' "$total_cost")"
+    echo "- Status: $([ "$rc" -eq 0 ] && echo OK || echo PARTIAL)"
+    echo
+    echo "## Per-batch results"
+    for cf in "$RUN_DIR"/phase-4.batch-*.cost(N); do
+      local label=$(basename "$cf" .cost); label=${label#phase-4.batch-}
+      local c=$(<"$cf")
+      local rcf="$RUN_DIR/phase-4.batch-${label}.rc"
+      local brc="?"; [ -s "$rcf" ] && brc=$(<"$rcf")
+      echo "- batch $label: rc=$brc cost=\$$c"
+    done
+  } > "$summary"
+  log "   ${_C_DIM}▸${_C_RESET} summary: $summary"
 }
 
 # ─── Phase 2: Granola pull ───────────────────────────────────────────────────
