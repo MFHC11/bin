@@ -43,7 +43,7 @@ Wait for explicit approval before making any API call.
   Blixt, Immaterial, Redoxion, Peter Robson, George Vives-Rouco
 - Never run dream cycle or Opus tasks without explicit approval
 
-## INBOX PROCESSING SKILL (auto-scaling)
+## INBOX PROCESSING SKILL (forward-only, auto-scaling)
 - Always use ~/bin/skills/inbox-enrich/SKILL.md when processing inbox/ files
 - Never use gbrain default ingestion skills for email or meeting files
 - Triggers: "process inbox", "drain inbox", "enrich inbox", "file inbox",
@@ -54,11 +54,16 @@ Wait for explicit approval before making any API call.
   1-10 → single-pass (one claude invocation)
   11-100 → parallel (batches of 10, max 10 concurrent subagents, first-3 canary)
   101+ → cost-guarded confirm (refuse if estimate >$30 without --force-large)
-- Skip filter: frontmatter tag `skip-enrich` excludes a file from runs
-- Watermark: `enriched: YYYY-MM-DD` in frontmatter marks a file as done
+- Skip filters: `legacy-inbox:` (frozen 2026-05-19 cohort), `enriched:` (non-email docs), `skip-enrich` tag
+- Email fate after enrichment: deleted (default) or moved to sources/email/YYYY-MM/ (archive exception)
+- Non-email docs: marked `enriched:` and stay in inbox/ for manual review
+- New citation form: `[Source: [gmail:<thread-id>](https://mail.google.com/mail/u/0/#inbox/<thread-id>) YYYY-MM-DD]`
+- Re-entry guard: every email run first greps `gmail:<thread-id>` to detect partial prior work
+- Mechanical dedup: stub only if no slug/variant/gbrain-search match AND no `email:`-or-`aliases:` match
 - --force-large implies --force-inbox; both bypass non-interactive refusals
 - Daily 9 AM cron stays single-pass (cron does ≤10/day)
 - Run summary written to ~/brain/.tasks/inbox-run-YYYY-MM-DD-HHMM.md
+- ADR: ~/brain/concepts/forward-only-email-handling.md
 
 ## SUNDAY BRIEFING SKILL
 - Always use ~/bin/skills/sunday-briefing/SKILL.md when generating Sunday or weekly briefings

@@ -1,13 +1,16 @@
 ---
 name: inbox-enrich
 description: >
-  Auto-scaling inbox processor — single-pass for 1-10 unprocessed files,
-  parallel subagent dispatch for 11-100, cost-guarded confirm for 100+.
-  Routes meeting recaps to meetings/, extracts entities, stubs missing
-  people + company pages (capped), appends compiled-truth bullets, adds
-  Timeline entries with citations, and rewrites plain-text mentions into
-  wikilinks. The brain-run Phase 4 wrapper implements enumeration,
-  routing, and subagent dispatch; this SKILL.md is the contract.
+  Auto-scaling forward-only inbox processor. After 2026-05-19 emails do
+  not stay in inbox/ after enrichment — signal moves to entity-page
+  citations using the gmail:<thread-id> form, and the inbox file is
+  deleted (default) or archived to sources/email/ (rare unique content).
+  Single-pass for 1-10 unprocessed files, parallel subagent dispatch
+  for 11-100, cost-guarded confirm for 100+. Routes meeting recaps to
+  meetings/, extracts entities, stubs missing people + company pages
+  with aliases: frontmatter for forward dedup. The brain-run Phase 4
+  wrapper implements enumeration, routing, and subagent dispatch; this
+  SKILL.md is the contract.
 triggers:
   - "process inbox"
   - "drain inbox"
@@ -27,7 +30,8 @@ writes_to:
   - people/
   - companies/
   - deals/
-  - inbox/ (wikilink rewrites + enriched: watermark — never delete)
+  - inbox/ (delete emails after enrichment; mark enriched: on non-email docs only)
+  - sources/email/YYYY-MM/ (rare archive route for unique-content emails)
   - .tasks/ (run summary)
 ---
 
@@ -65,7 +69,10 @@ The wrapper enumerates unprocessed files first, then routes by count:
 A file in `~/brain/inbox/*.md` is unprocessed iff ALL hold:
 
 - Filename is not `README.md`
-- Frontmatter has no `enriched: YYYY-MM-DD` line
+- Frontmatter has no `legacy-inbox:` line (frozen cohort from 2026-05-19;
+  308 enriched files kept as-is, never touched)
+- Frontmatter has no `enriched:` line (emails never get this watermark
+  in the new flow; only non-email docs do)
 - Frontmatter has no `skip-enrich` tag
 
 ### Cost guards
@@ -100,19 +107,22 @@ When count > 10:
 6. After all batches complete, the wrapper commits each successful batch
    (commit is handled by the brain-run wrapper, not by the agent).
 
-## Per-file enrichment rules (unchanged)
+## Per-file enrichment rules
 
-See `~/bin/prompts/inbox-enrich.md` Steps 1-9. Invariants:
+See `~/bin/prompts/inbox-enrich.md` Steps 1-8. Invariants:
 
 | Rule | Detail |
 |---|---|
 | Per-subagent cap | ≤ 10 files. |
-| Routing | Meeting recaps (strict 3-test) → `meetings/`. Emails + docs stay in `inbox/`. |
-| Stub creation | `mcp__gbrain__search` first; cap 50 people / 25 companies per subagent. |
-| Compiled-truth | Append-only with `[Source: [[inbox/...]]]` citations. |
-| Timeline | One line per file per target with citation. |
-| Wikilinks | First-occurrence-only; skip code blocks and frontmatter. |
-| Watermark | `enriched: YYYY-MM-DD` in frontmatter on every processed file. |
+| Routing | Meeting recaps (strict 3-test) → `meetings/`. Emails → deleted (default) or `sources/email/YYYY-MM/` (archive exception). Non-email docs stay in `inbox/`. |
+| Re-entry guard | Before processing any email, grep `gmail:<thread-id>` across people/companies/deals; if found, skip enrichment and delete the inbox file. |
+| Dedup | Mechanical only: email-local-part vs `email:` frontmatter, OR exact name in `aliases:` list. No "context" inference. |
+| Stub creation | Exact slug → variants → `mcp__gbrain__search` → mechanical alias grep. New stubs include `aliases:` and `email:` frontmatter. Cap 50 people / 25 companies per subagent. |
+| Compiled-truth | Append-only with `[Source: [gmail:<thread-id>](https://mail.google.com/mail/u/0/#inbox/<thread-id>) YYYY-MM-DD]` citations. |
+| Timeline | One line per file per target with the gmail citation. |
+| Email fate | Delete after successful enrichment (default); archive to `sources/email/YYYY-MM/` if body >8KB substantive OR `archive: true` tag. |
+| Non-email fate | `enriched: YYYY-MM-DD` watermark, stays in `inbox/` for manual review. |
+| Legacy cohort | 308 files marked `legacy-inbox: 2026-05-19` — never touched. |
 
 ## Output
 
