@@ -1,0 +1,70 @@
+#!/bin/zsh
+# brain-sync — backup local brain to GitHub and Supabase
+
+set -euo pipefail
+
+BRAIN_DIR="/Users/marcusclover/brain"
+BUN_PATH="$HOME/.bun/bin"
+LOG_FILE="$HOME/.gbrain/sync.log"
+
+export PATH="$BUN_PATH:$HOME/.local/bin:$PATH"
+source ~/.zshrc
+
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo ""
+echo "═══════════════════════════════════════"
+echo "  🧠 Brain Backup — $(date '+%Y-%m-%d %H:%M')"
+echo "📝 Pulling Granola meetings..."
+~/bin/granola-to-brain
+echo "═══════════════════════════════════════"
+
+cd "$BRAIN_DIR"
+
+# ─── STEP 1: COMMIT AND PUSH TO GITHUB ────────────────────────────────────────
+echo ""
+echo "⬆️  Step 1 — Backing up to GitHub..."
+git add .
+STAGED=$(git diff --cached --name-only | wc -l | tr -d ' ')
+
+if [ "$STAGED" -eq 0 ]; then
+  echo "   ✓ Nothing new to commit"
+else
+  git commit -m "brain backup — $(date '+%Y-%m-%d %H:%M')"
+  git push
+  echo "   ✓ Pushed $STAGED file(s) to GitHub"
+fi
+
+# ─── STEP 2: SYNC TO SUPABASE ─────────────────────────────────────────────────
+echo ""
+echo "🔄 Step 2 — Syncing to Supabase..."
+SYNC_RESULT=$(gbrain sync --repo "$BRAIN_DIR" 2>&1)
+PAGES_ADDED=$(echo "$SYNC_RESULT" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d.get('added',0))" 2>/dev/null || echo "0")
+echo "   ✓ $PAGES_ADDED new pages indexed"
+
+# ─── STEP 3: EMBED NEW PAGES ──────────────────────────────────────────────────
+echo ""
+echo "🧬 Step 3 — Embedding new pages..."
+gbrain embed --stale 2>&1
+echo "   ✓ Embeddings up to date"
+
+# ─── STEP 4: HEALTH CHECK ─────────────────────────────────────────────────────
+echo ""
+echo "🏥 Step 4 — Health check..."
+DOCTOR=$(gbrain doctor --json 2>&1)
+PAGES=$(echo "$DOCTOR" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); \
+  [print(c['message']) for c in d['checks'] if c['name']=='connection']" \
+  2>/dev/null || echo "unknown")
+echo "   ✓ $PAGES"
+
+# ─── DONE ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "═══════════════════════════════════════"
+echo "  ✅ Backup complete — $(date '+%H:%M')"
+echo "═══════════════════════════════════════"
+echo ""
+
+osascript -e "display notification \"$PAGES backed up to GitHub and Supabase\" with title \"🧠 Brain Backup Complete\" sound name \"Glass\""

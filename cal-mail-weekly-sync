@@ -1,0 +1,93 @@
+#!/bin/zsh
+# cal-mail-weekly-sync — pull last 7 days of Calendar + Gmail into ~/brain
+# then commit + push + Supabase sync via brain-sync.
+
+set -euo pipefail
+
+BRAIN_DIR="$HOME/brain"
+PROMPT_FILE="$HOME/bin/prompts/cal-mail-weekly-sync.md"
+LOG_FILE="$HOME/logs/cal-mail-weekly-sync.log"
+WATERMARK="$BRAIN_DIR/.last-email-sync"
+
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+# Timestamp every line of stdout/stderr to the log AND the terminal.
+exec > >(while IFS= read -r line; do printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line"; done | tee -a "$LOG_FILE") 2>&1
+
+echo ""
+echo "═══════════════════════════════════════"
+echo "  📬 cal-mail-weekly-sync — $(date '+%Y-%m-%d %H:%M')"
+echo "═══════════════════════════════════════"
+
+# ─── STEP 0: Sanity ───────────────────────────────────────────────────────────
+if [ ! -f "$PROMPT_FILE" ]; then
+  echo "❌ Prompt file missing: $PROMPT_FILE"
+  exit 1
+fi
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo "❌ 'claude' CLI not found in PATH. Aborting."
+  exit 1
+fi
+
+cd "$BRAIN_DIR"
+
+# ─── STEP 1: Get a clean working tree before the agent writes ─────────────────
+echo ""
+echo "🔄 Step 1 — Rebasing local brain against origin..."
+
+STASHED=0
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  git stash push -u -m "cal-mail-weekly-sync auto-stash $(date '+%Y-%m-%d %H:%M:%S')"
+  STASHED=1
+  echo "   ✓ Stashed local changes"
+fi
+
+git pull --rebase
+echo "   ✓ Rebase complete"
+
+if [ "$STASHED" -eq 1 ]; then
+  if git stash pop; then
+    echo "   ✓ Restored stashed changes"
+  else
+    echo "❌ stash pop produced conflicts — resolve manually before re-running."
+    exit 1
+  fi
+fi
+
+# Show the watermark we're about to feed the agent.
+if [ -f "$WATERMARK" ]; then
+  echo "   ℹ Watermark: $(cat "$WATERMARK")"
+else
+  echo "   ℹ Watermark: <none — agent will default to 7 days ago>"
+fi
+
+# ─── STEP 2: Run the Claude Code agent ────────────────────────────────────────
+echo ""
+echo "🤖 Step 2 — Running sync agent (sonnet-4-6, max 30 turns)..."
+
+PROMPT_BODY="$(cat "$PROMPT_FILE")"
+
+# --print runs headless; the agent writes files directly via its tool grants.
+claude \
+  --model claude-sonnet-4-6 \
+  --max-turns 30 \
+  --allowedTools "mcp__claude_ai_Gmail__*,mcp__claude_ai_Google_Calendar__*,mcp__gbrain__*,Bash,Read,Write" \
+  --print "$PROMPT_BODY"
+
+echo "   ✓ Agent finished"
+
+# ─── STEP 3: Hand off to brain-sync (commit + push + Supabase) ────────────────
+echo ""
+echo "🧠 Step 3 — Handing off to brain-sync..."
+"$HOME/bin/brain-sync"
+
+echo ""
+echo "═══════════════════════════════════════"
+echo "  ✅ cal-mail-weekly-sync complete — $(date '+%H:%M')"
+echo "═══════════════════════════════════════"
+echo ""
+
+osascript -e 'display notification "Calendar + Gmail synced into brain" with title "📬 Weekly Brain Sync" sound name "Glass"' || true

@@ -1,0 +1,1126 @@
+#!/bin/zsh
+# brain-run — master brain orchestrator.
+#
+# SKELETON v0.1.0 — implements Phase 0 (preflight), Phase 1 (git safety),
+# and Phase 9 (summary report) for real. Phases 2, 5, 7, 8 are stubs that
+# write succeeded state. Phases 3, 4, 6 don't run yet (excluded by mode
+# flags during testing).
+#
+# Spec: brain-run technical spec §4 (built 2026-05-08).
+# IMPORTANT (zsh): never use `local path=...` — `path` is tied to $PATH
+# and silently corrupts command lookup inside the function. Use `local file`.
+
+set -uo pipefail   # NOT -e; phases handle their own errors
+
+# ─── Constants (env-overridable for tests) ───────────────────────────────────
+typeset -g BRAIN_DIR="${BRAIN_DIR:-$HOME/brain}"
+typeset -g GBRAIN_BIN="${GBRAIN_BIN:-$HOME/.bun/bin/gbrain}"
+typeset -g CLAUDE_BIN="${CLAUDE_BIN:-}"   # resolved in Phase 0 if empty
+typeset -g GRANOLA_BIN="${GRANOLA_BIN:-$HOME/bin/granola-to-brain}"
+typeset -g PROMPT_CALMAIL="${PROMPT_CALMAIL:-$HOME/bin/prompts/cal-mail-weekly-sync.md}"
+typeset -g PROMPT_INBOX="${PROMPT_INBOX:-$HOME/bin/prompts/inbox-enrich.md}"
+typeset -g GBRAIN_HOME="${GBRAIN_HOME:-$HOME/.gbrain}"
+typeset -g RUNS_DIR="$GBRAIN_HOME/runs"
+typeset -g REPORT_DIR="$BRAIN_DIR/.tasks"
+typeset -g COST_LOG="$GBRAIN_HOME/cost-30d.jsonl"
+typeset -g BRAIN_RUN_VERSION="0.9.1-phase4"
+
+# Models + tool grants (per spec §4.4)
+typeset -g MODEL_HAIKU="claude-haiku-4-5"
+typeset -g MODEL_SONNET="claude-sonnet-4-6"
+typeset -g MODEL_OPUS="claude-opus-4-7"
+typeset -g TOOLS_CALMAIL="mcp__claude_ai_Gmail__*,mcp__claude_ai_Google_Calendar__*,mcp__gbrain__*,Bash,Read,Write,Edit"
+typeset -g TOOLS_INBOX="mcp__plugin_claude-mem_mcp-search__*,mcp__gbrain__*,Bash,Read,Write,Edit"
+typeset -g BRAIN_RUN_LIB_MODE="${BRAIN_RUN_LIB_MODE:-0}"
+
+# ─── Mutable run state ───────────────────────────────────────────────────────
+# Use ${VAR:-} so a caller (e.g., a unit test sourcing this file with
+# BRAIN_RUN_LIB_MODE=1) can pre-set RUN_ID and have it preserved instead of
+# blanked. main() always overrides via parse_args, so this is safe in production.
+typeset -g RUN_ID="${RUN_ID:-}"
+typeset -g RUN_DIR="${RUN_DIR:-}"
+typeset -g RUN_LOG="${RUN_LOG:-}"
+typeset -g MANIFEST="${MANIFEST:-}"
+typeset -g RUN_STARTED_AT="${RUN_STARTED_AT:-}"
+typeset -g RUN_STARTED_EPOCH=0
+typeset -g MODE="weekly"
+typeset -g WITH_DREAM=0
+typeset -g YES_DREAM=0
+typeset -g NO_MAIL=0
+typeset -g NO_ENRICH=0
+typeset -g NO_GRANOLA=0
+typeset -g NO_DREAM_MECH=0
+typeset -g NO_PUSH=0
+typeset -g RESUME=0
+typeset -g DRY_RUN=0
+typeset -ga PASSED_FLAGS
+PASSED_FLAGS=()
+
+# Per-phase associative state — populated as phases run
+typeset -gA PHASE_STATUS PHASE_DURATION PHASE_COST PHASE_SKIP_REASON
+typeset -gA PHASE_COST_ESTIMATE PHASE_COST_ACTUAL
+typeset -g ANY_PHASE_FAILED=0
+typeset -ga FAILED_PHASES
+FAILED_PHASES=()
+typeset -g STATUS_FILE="$GBRAIN_HOME/last-run.json"
+
+# ─── Color helpers ───────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  typeset -g _C_GREEN=$'\033[32m' _C_RED=$'\033[31m' _C_YELLOW=$'\033[33m'
+  typeset -g _C_CYAN=$'\033[36m' _C_DIM=$'\033[2m' _C_BOLD=$'\033[1m'
+  typeset -g _C_RESET=$'\033[0m'
+else
+  typeset -g _C_GREEN="" _C_RED="" _C_YELLOW="" _C_CYAN="" _C_DIM="" _C_BOLD="" _C_RESET=""
+fi
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+log() {
+  if [ -n "$RUN_LOG" ] && [ -f "$RUN_LOG" ]; then
+    printf "%s\n" "$*" | tee -a "$RUN_LOG"
+  else
+    printf "%s\n" "$*"
+  fi
+}
+
+log_err() {
+  if [ -n "$RUN_LOG" ] && [ -f "$RUN_LOG" ]; then
+    printf "%sERROR%s %s\n" "$_C_RED" "$_C_RESET" "$*" | tee -a "$RUN_LOG" >&2
+  else
+    printf "%sERROR%s %s\n" "$_C_RED" "$_C_RESET" "$*" >&2
+  fi
+}
+
+die() {
+  log_err "$1"
+  exit "${2:-1}"
+}
+
+now_iso() { date +"%Y-%m-%dT%H:%M:%S%z"; }
+now_epoch() { date +%s; }
+
+# ─── CLI parsing ─────────────────────────────────────────────────────────────
+print_help() {
+  cat <<EOF
+brain-run — master brain orchestrator (skeleton v$BRAIN_RUN_VERSION)
+
+USAGE:
+  brain-run [MODE] [FLAGS]
+
+MODES:
+  --quick           Phase 0,1,2,5,7,8,9 only. No LLM. Daily.
+  --weekly          All phases except Opus. Default.
+
+FLAGS:
+  --with-dream      Add Phase 6 (Opus synthesis). Requires approval.
+  --yes-dream       Pre-approve Phase 6. Implies --with-dream.
+  --no-mail         Skip Phase 3.
+  --no-enrich       Skip Phase 4.
+  --no-granola      Skip Phase 2.
+  --no-dream-mech   Skip Phase 5 (gbrain dream).
+  --no-push         Skip Phase 7.
+  --resume          Resume last incomplete run.
+  --dry-run         Print plan; don't execute.
+  --run-id=ID       Override RUN_ID (test harness).
+  -h, --help        Show this help.
+  -v, --version     Print version.
+
+EXIT CODES:
+  0   success
+  1   one or more phases failed
+  2   pre-flight failure (missing binary, etc.)
+  3   git safety failure (conflict)
+  4   user cancelled approval
+  64  bad CLI usage
+EOF
+}
+
+parse_args() {
+  PASSED_FLAGS=("$@")
+
+  for arg in "$@"; do
+    case "$arg" in
+      --quick)        MODE="quick" ;;
+      --weekly)       MODE="weekly" ;;
+      --with-dream)   WITH_DREAM=1 ;;
+      --yes-dream)    YES_DREAM=1; WITH_DREAM=1 ;;
+      --no-mail)      NO_MAIL=1 ;;
+      --no-enrich)    NO_ENRICH=1 ;;
+      --no-granola)   NO_GRANOLA=1 ;;
+      --no-dream-mech) NO_DREAM_MECH=1 ;;
+      --no-push)      NO_PUSH=1 ;;
+      --resume)       RESUME=1 ;;
+      --dry-run)      DRY_RUN=1 ;;
+      --run-id=*)     RUN_ID="${arg#--run-id=}" ;;
+      -h|--help)      print_help; exit 0 ;;
+      -v|--version)   echo "brain-run $BRAIN_RUN_VERSION"; exit 0 ;;
+      *)              die "unknown flag: $arg" 64 ;;
+    esac
+  done
+
+  # Validate combinations
+  if [ "$MODE" = "quick" ] && [ "$WITH_DREAM" = "1" ]; then
+    die "--quick + --with-dream is invalid: dream requires --weekly" 64
+  fi
+
+  # Default RUN_ID
+  if [ -z "$RUN_ID" ]; then
+    RUN_ID="$(date +%Y%m%dT%H%M%S)"
+  fi
+}
+
+# ─── State / manifest helpers ────────────────────────────────────────────────
+write_state() {
+  local n="$1"
+  local s="$2"
+  echo "$s" > "$RUN_DIR/phase-$n.state"
+  PHASE_STATUS[$n]="$s"
+}
+
+# Export per-phase state to env so commit_manifest's python helper reads them.
+export_phase_env() {
+  local n
+  for n in 0 1 2 3 4 5 6 7 8 9; do
+    export "PSTAT_$n=${PHASE_STATUS[$n]:-}"
+    export "PDUR_$n=${PHASE_DURATION[$n]:-0}"
+    export "PCOST_$n=${PHASE_COST[$n]:-0}"
+    export "PCEST_$n=${PHASE_COST_ESTIMATE[$n]:-0}"
+    export "PCACT_$n=${PHASE_COST_ACTUAL[$n]:-0}"
+    export "PSKIP_$n=${PHASE_SKIP_REASON[$n]:-}"
+  done
+  export PASSED_FLAGS_RAW="$(printf '%s\n' "${PASSED_FLAGS[@]}")"
+  export RUN_ID RUN_STARTED_AT MODE MANIFEST
+}
+
+# Render manifest.json atomically. All data comes from env (set by export_phase_env).
+# Single python invocation; no shell→python text substitution.
+commit_manifest() {
+  export_phase_env
+  python3 - <<'PYEOF' && true
+import json, os, sys
+
+phases = {}
+for n in ["0","1","2","3","4","5","6","7","8","9"]:
+    s = os.environ.get(f"PSTAT_{n}", "")
+    if not s:
+        continue
+    phases[n] = {
+        "status": s,
+        "duration_s": int(os.environ.get(f"PDUR_{n}", "0") or "0"),
+        "cost_usd": float(os.environ.get(f"PCOST_{n}", "0") or "0"),
+        "cost_estimate_usd": float(os.environ.get(f"PCEST_{n}", "0") or "0"),
+        "cost_actual_usd": float(os.environ.get(f"PCACT_{n}", "0") or "0"),
+        "skip_reason": os.environ.get(f"PSKIP_{n}", "") or None,
+    }
+
+total_dur = sum(p["duration_s"] for p in phases.values())
+total_cost = sum(p["cost_usd"] for p in phases.values())
+
+flags_raw = os.environ.get("PASSED_FLAGS_RAW", "")
+flags = [line for line in flags_raw.split("\n") if line.strip()]
+
+m = {
+    "run_id": os.environ["RUN_ID"],
+    "started_at": os.environ["RUN_STARTED_AT"],
+    "mode": os.environ["MODE"],
+    "flags": flags,
+    "phases": phases,
+    "totals": {"duration_s": total_dur, "cost_usd": round(total_cost, 6)},
+}
+
+manifest_path = os.environ["MANIFEST"]
+tmp = manifest_path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(m, f, indent=2)
+os.replace(tmp, manifest_path)
+PYEOF
+}
+
+# ─── Watermark protection (Opus review item 3) ───────────────────────────────
+# Wrap a command (typically an LLM phase that may write watermarks). On
+# failure, restore the pre-call watermark from a backup. On success, drop the
+# backup. The Phase 3 prompt's hard rule says claude must not write the
+# watermark on partial failure, but we double-check at script level — defense
+# in depth, since the prompt's contract is enforced inside the LLM.
+#
+# Usage: with_watermark_guard <inner_function_name> [args...]
+#   with_watermark_guard phase_3_calmail_inner
+with_watermark_guard() {
+  local watermark="$BRAIN_DIR/.last-email-sync"
+  local backup="$watermark.bak.$RUN_ID"
+  local had=0
+
+  if [ -f "$watermark" ]; then
+    cp "$watermark" "$backup"
+    had=1
+  fi
+
+  "$@"
+  local rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    if [ "$had" = "1" ]; then
+      mv "$backup" "$watermark"
+      log "   ${_C_YELLOW}!${_C_RESET} watermark restored to pre-call value (phase failed)"
+    elif [ -f "$watermark" ]; then
+      # No watermark before; one exists now (claude wrote it but phase failed).
+      # Trust the prompt rule: this shouldn't happen. Remove it to be safe.
+      rm -f "$watermark"
+      log "   ${_C_YELLOW}!${_C_RESET} stray watermark removed (phase failed, no prior value)"
+    fi
+  else
+    rm -f "$backup"
+  fi
+
+  return $rc
+}
+
+# ─── Cost capture ────────────────────────────────────────────────────────────
+# Per Opus review item 4: separate "estimate" (logged before LLM call) from
+# "actual" (logged after, parsed from claude JSON). Both go to $COST_LOG with
+# a `kind` field. PHASE_COST is the actual cost (used for manifest totals);
+# PHASE_COST_ESTIMATE is the pre-call estimate (used for pre-flight visibility).
+#
+# Idempotency: append-only audit. Re-runs (resume) append new lines; the cost
+# log can sum higher than the manifest if a phase was retried — that is the
+# truthful picture of what was spent.
+
+_record_cost_line() {
+  local n="$1" model="$2" cost="$3" kind="$4"
+  mkdir -p "$(dirname "$COST_LOG")"
+  RUN_ID="$RUN_ID" PHASE_N="$n" MODEL="$model" COST="$cost" KIND="$kind" \
+  TS="$(now_iso)" COST_LOG="$COST_LOG" python3 - <<'PYEOF'
+import json, os
+line = json.dumps({
+    "run_id": os.environ["RUN_ID"],
+    "phase": int(os.environ["PHASE_N"]),
+    "model": os.environ["MODEL"],
+    "kind": os.environ["KIND"],
+    "cost_usd": float(os.environ["COST"]),
+    "ts": os.environ["TS"],
+})
+with open(os.environ["COST_LOG"], "a") as f:
+    f.write(line + "\n")
+PYEOF
+}
+
+# Log a cost estimate BEFORE invoking the LLM. Visible in pre-call logs and
+# the cost audit. Does NOT update PHASE_COST (which tracks actual spend).
+record_cost_estimate() {
+  local n="$1" model="$2" cost="$3"
+  PHASE_COST_ESTIMATE[$n]="$cost"
+  _record_cost_line "$n" "$model" "$cost" "estimate"
+}
+
+# Log actual cost AFTER the LLM call returned, parsed from claude --output-format
+# json's `total_cost_usd` field. Updates PHASE_COST so the manifest reflects it.
+record_cost_actual() {
+  local n="$1" model="$2" cost="$3"
+  PHASE_COST[$n]="$cost"
+  PHASE_COST_ACTUAL[$n]="$cost"
+  _record_cost_line "$n" "$model" "$cost" "actual"
+}
+
+# Backward-compat alias for the pre-Opus-review record_cost API.
+# New code should call record_cost_actual or record_cost_estimate explicitly.
+record_cost() {
+  record_cost_actual "$@"
+}
+
+# ─── Phase scaffolding ───────────────────────────────────────────────────────
+print_phase_header() {
+  local n="$1"
+  local name="$2"
+  log ""
+  log "──────────────────────────────────────────────────────"
+  log " [$n/9] $name"
+  log "──────────────────────────────────────────────────────"
+}
+
+print_phase_outcome() {
+  local n="$1"
+  local outcome="$2"
+  local dur="${3:-0}"
+  case "$outcome" in
+    succeeded) log "   ${_C_GREEN}✓${_C_RESET} done in ${dur}s" ;;
+    skipped)   log "   ${_C_DIM}↷ skipped (${PHASE_SKIP_REASON[$n]:-})${_C_RESET}" ;;
+    failed)    log "   ${_C_RED}✗${_C_RESET} failed in ${dur}s" ;;
+  esac
+}
+
+begin_phase() {
+  local n="$1"
+  local t0
+  t0=$(now_epoch)
+  PHASE_DURATION[$n]=0
+  PHASE_COST[$n]=0
+  export "P_T0_$n=$t0"
+  write_state "$n" "started"
+  export_phase_env
+  commit_manifest
+}
+
+end_phase() {
+  local n="$1"
+  local outcome="$2"   # succeeded | skipped | failed
+  local reason="${3:-}"
+
+  local t0_var="P_T0_$n"
+  local t0="${(P)t0_var:-0}"
+  local t1
+  t1=$(now_epoch)
+  PHASE_DURATION[$n]=$((t1 - t0))
+  if [ "$outcome" = "skipped" ]; then
+    PHASE_DURATION[$n]=0
+    PHASE_SKIP_REASON[$n]="$reason"
+  fi
+  if [ "$outcome" = "failed" ]; then
+    ANY_PHASE_FAILED=1
+  fi
+  write_state "$n" "$outcome"
+  print_phase_outcome "$n" "$outcome" "${PHASE_DURATION[$n]}"
+  export_phase_env
+  commit_manifest
+}
+
+# ─── Phase 0: Preflight ──────────────────────────────────────────────────────
+phase_0_preflight() {
+  print_phase_header 0 "Preflight"
+  begin_phase 0
+
+  # Resolve claude CLI
+  if [ -z "$CLAUDE_BIN" ]; then
+    CLAUDE_BIN=$(command -v claude 2>/dev/null || echo "")
+  fi
+
+  if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
+    log "   ${_C_RED}✗${_C_RESET} claude CLI not found (CLAUDE_BIN='$CLAUDE_BIN')"
+    end_phase 0 failed
+    exit 2
+  fi
+  log "   ${_C_GREEN}✓${_C_RESET} claude CLI:   $CLAUDE_BIN"
+
+  if [ ! -x "$GBRAIN_BIN" ]; then
+    log "   ${_C_RED}✗${_C_RESET} gbrain CLI not found at $GBRAIN_BIN"
+    end_phase 0 failed
+    exit 2
+  fi
+  log "   ${_C_GREEN}✓${_C_RESET} gbrain CLI:   $GBRAIN_BIN"
+
+  if ! command -v git >/dev/null 2>&1; then
+    log "   ${_C_RED}✗${_C_RESET} git not found"
+    end_phase 0 failed
+    exit 2
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "   ${_C_RED}✗${_C_RESET} python3 not found"
+    end_phase 0 failed
+    exit 2
+  fi
+
+  # Brain dir is a git repo
+  if [ ! -d "$BRAIN_DIR/.git" ]; then
+    log "   ${_C_RED}✗${_C_RESET} brain dir is not a git repo: $BRAIN_DIR"
+    end_phase 0 failed
+    exit 2
+  fi
+  log "   ${_C_GREEN}✓${_C_RESET} brain repo:   $BRAIN_DIR"
+
+  # Supervisor health (skipped in tests)
+  if [ "${BRAIN_RUN_SKIP_SUPERVISOR:-0}" = "1" ]; then
+    log "   ${_C_DIM}↷ supervisor:  skipped (BRAIN_RUN_SKIP_SUPERVISOR=1)${_C_RESET}"
+  else
+    # Best-effort; non-fatal if it can't report.
+    if "$GBRAIN_BIN" jobs supervisor status --json 2>/dev/null \
+        | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('running') else 1)" 2>/dev/null; then
+      log "   ${_C_GREEN}✓${_C_RESET} supervisor:   running"
+    else
+      log "   ${_C_YELLOW}!${_C_RESET} supervisor:   not running (Phase 5 will fail if needed)"
+    fi
+  fi
+
+  log "   ${_C_GREEN}✓${_C_RESET} run dir:      $RUN_DIR"
+  end_phase 0 succeeded
+}
+
+# ─── Phase 1: Git safety ─────────────────────────────────────────────────────
+phase_1_git_safety() {
+  print_phase_header 1 "Git safety"
+  begin_phase 1
+
+  cd "$BRAIN_DIR" || { end_phase 1 failed; exit 3; }
+
+  local stashed=0
+  local stash_count=0
+  if ! git diff --quiet || ! git diff --cached --quiet || \
+       [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    stash_count=$(git status --porcelain | wc -l | tr -d ' ')
+    if git stash push -u -m "brain-run auto-stash $RUN_ID" >>"$RUN_LOG" 2>&1; then
+      stashed=1
+      log "   ${_C_GREEN}✓${_C_RESET} stashed $stash_count file(s)"
+    else
+      log "   ${_C_RED}✗${_C_RESET} stash push failed"
+      end_phase 1 failed
+      exit 3
+    fi
+  else
+    log "   ${_C_GREEN}✓${_C_RESET} working tree clean"
+  fi
+
+  if git pull --rebase >>"$RUN_LOG" 2>&1; then
+    log "   ${_C_GREEN}✓${_C_RESET} rebase: clean against origin"
+  else
+    log "   ${_C_RED}✗${_C_RESET} pull --rebase failed"
+    end_phase 1 failed
+    exit 3
+  fi
+
+  if [ "$stashed" = "1" ]; then
+    if git stash pop >>"$RUN_LOG" 2>&1; then
+      log "   ${_C_GREEN}✓${_C_RESET} stash popped clean"
+    else
+      log "   ${_C_RED}✗${_C_RESET} stash pop produced conflicts — resolve manually"
+      log "       conflicted files:"
+      git diff --name-only --diff-filter=U 2>/dev/null | sed 's|^|         |' | tee -a "$RUN_LOG"
+      end_phase 1 failed
+      exit 3
+    fi
+  fi
+
+  end_phase 1 succeeded
+}
+
+# ─── Phase 3: Cal-mail sync (Sonnet) ─────────────────────────────────────────
+# Headless claude --print invocation against ~/bin/prompts/cal-mail-weekly-sync.md.
+# Wrapped in with_watermark_guard so a partial failure doesn't advance the
+# Gmail/Calendar watermark. Cost estimate logged before, actual logged after.
+phase_3_calmail() {
+  # Skipped under --quick. Don't begin_phase so phase-3.state stays absent
+  # (matches T1's expectation that --quick → phase 3 state == "").
+  if [ "$MODE" = "quick" ]; then
+    return 0
+  fi
+
+  print_phase_header 3 "Cal-mail sync ($MODEL_SONNET, max 30 turns)"
+  begin_phase 3
+
+  if [ "$NO_MAIL" = "1" ]; then
+    log "   ${_C_DIM}↷ skipped (--no-mail)${_C_RESET}"
+    end_phase 3 skipped "--no-mail"
+    return 0
+  fi
+
+  if [ ! -f "$PROMPT_CALMAIL" ]; then
+    log "   ${_C_RED}✗${_C_RESET} prompt file missing: $PROMPT_CALMAIL"
+    end_phase 3 failed
+    return 1
+  fi
+
+  if [ ! -x "$CLAUDE_BIN" ]; then
+    log "   ${_C_RED}✗${_C_RESET} claude CLI not executable: $CLAUDE_BIN"
+    end_phase 3 failed
+    return 1
+  fi
+
+  # Pre-call estimate (Opus item 4). Visible in cost log + manifest before
+  # any real money is spent. Sonnet cal-mail typically costs $0.50–1.50.
+  record_cost_estimate 3 "$MODEL_SONNET" "1.00"
+  log "   ${_C_DIM}▸${_C_RESET} pre-call estimate: \$1.00 (range \$0.50–1.50)"
+  log "   ${_C_DIM}▸${_C_RESET} watermark: $(cat "$BRAIN_DIR/.last-email-sync" 2>/dev/null || echo '<none>')"
+
+  # Run claude inside watermark guard. Inner function captures cost.
+  with_watermark_guard _phase_3_run_agent
+  local rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    log "   ${_C_RED}✗${_C_RESET} agent exit $rc (see phase-3.log)"
+    end_phase 3 failed
+    return 1
+  fi
+
+  log "   ${_C_GREEN}✓${_C_RESET} watermark advanced to: $(cat "$BRAIN_DIR/.last-email-sync" 2>/dev/null || echo '<unchanged>')"
+  end_phase 3 succeeded
+}
+
+_phase_3_run_agent() {
+  local prompt_body
+  prompt_body=$(<"$PROMPT_CALMAIL")
+  local output_json="$RUN_DIR/phase-3.output.json"
+  local agent_log="$RUN_DIR/phase-3.log"
+
+  log "   ${_C_DIM}▸${_C_RESET} running headless agent ($MODEL_SONNET)..."
+
+  "$CLAUDE_BIN" \
+    --model "$MODEL_SONNET" \
+    --max-turns 30 \
+    --allowedTools "$TOOLS_CALMAIL" \
+    --output-format json \
+    --print "$prompt_body" \
+    > "$output_json" 2> "$agent_log"
+  local rc=$?
+
+  # Surface agent stderr in the run log for visibility
+  if [ -s "$agent_log" ]; then
+    cat "$agent_log" >> "$RUN_LOG" 2>/dev/null || true
+  fi
+
+  # Extract actual cost from claude's --output-format json
+  if [ -s "$output_json" ]; then
+    local cost
+    cost=$(OUTJSON="$output_json" python3 - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    d = json.load(open(os.environ["OUTJSON"]))
+    print(d.get("total_cost_usd", 0))
+except Exception:
+    print(0)
+PYEOF
+)
+    record_cost_actual 3 "$MODEL_SONNET" "${cost:-0}"
+    log "   ${_C_GREEN}✓${_C_RESET} actual cost: \$$cost"
+  else
+    log "   ${_C_YELLOW}!${_C_RESET} no JSON output captured; cost not recorded"
+    record_cost_actual 3 "$MODEL_SONNET" "0"
+  fi
+
+  return $rc
+}
+
+# ─── Phase 4: Inbox & enrich (Sonnet) ────────────────────────────────────────
+# Headless claude --print invocation against ~/bin/prompts/inbox-enrich.md.
+# Reads every file in inbox/, classifies, routes meeting-typed files to
+# meetings/, enriches existing people/companies/deals/projects pages with
+# new info + timeline entries + source citations, creates stubs for missing
+# entities, and wires two-way wikilinks. No external watermark — inbox files
+# themselves are the unit of work; what's left in inbox/ at the end gets
+# picked up on the next run.
+phase_4_inbox_enrich() {
+  # Skipped under --quick. Same pattern as Phase 3 — don't begin_phase so
+  # phase-4.state stays absent.
+  if [ "$MODE" = "quick" ]; then
+    return 0
+  fi
+
+  print_phase_header 4 "Inbox & enrich ($MODEL_SONNET, max 30 turns)"
+  begin_phase 4
+
+  if [ "$NO_ENRICH" = "1" ]; then
+    log "   ${_C_DIM}↷ skipped (--no-enrich)${_C_RESET}"
+    end_phase 4 skipped "--no-enrich"
+    return 0
+  fi
+
+  if [ ! -f "$PROMPT_INBOX" ]; then
+    log "   ${_C_RED}✗${_C_RESET} prompt file missing: $PROMPT_INBOX"
+    end_phase 4 failed
+    return 1
+  fi
+
+  if [ ! -x "$CLAUDE_BIN" ]; then
+    log "   ${_C_RED}✗${_C_RESET} claude CLI not executable: $CLAUDE_BIN"
+    end_phase 4 failed
+    return 1
+  fi
+
+  # Snapshot inbox count before run so we can report what got processed.
+  local inbox_before
+  inbox_before=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+  log "   ${_C_DIM}▸${_C_RESET} inbox files before: $inbox_before"
+
+  # Pre-call estimate. Inbox enrichment processes up to 25 files per run
+  # with up to 30 turns of Sonnet; cost similar to Phase 3.
+  record_cost_estimate 4 "$MODEL_SONNET" "2.00"
+  log "   ${_C_DIM}▸${_C_RESET} pre-call estimate: \$2.00 (range \$1.00–3.00)"
+
+  _phase_4_run_agent
+  local rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    log "   ${_C_RED}✗${_C_RESET} agent exit $rc (see phase-4.log)"
+    end_phase 4 failed
+    return 1
+  fi
+
+  local inbox_after
+  inbox_after=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+  local processed=$((inbox_before - inbox_after))
+  echo "$processed" > "$RUN_DIR/phase-4.metric.processed"
+  log "   ${_C_GREEN}✓${_C_RESET} inbox files after: $inbox_after (delta: $processed)"
+
+  end_phase 4 succeeded
+}
+
+_phase_4_run_agent() {
+  local prompt_body
+  prompt_body=$(<"$PROMPT_INBOX")
+  local output_json="$RUN_DIR/phase-4.output.json"
+  local agent_log="$RUN_DIR/phase-4.log"
+
+  log "   ${_C_DIM}▸${_C_RESET} running headless agent ($MODEL_SONNET)..."
+
+  "$CLAUDE_BIN" \
+    --model "$MODEL_SONNET" \
+    --max-turns 30 \
+    --allowedTools "$TOOLS_INBOX" \
+    --output-format json \
+    --print "$prompt_body" \
+    > "$output_json" 2> "$agent_log"
+  local rc=$?
+
+  # Surface agent stderr in the run log for visibility
+  if [ -s "$agent_log" ]; then
+    cat "$agent_log" >> "$RUN_LOG" 2>/dev/null || true
+  fi
+
+  # Extract cost + terminal_reason from claude's --output-format json.
+  # terminal_reason="max_turns" is a bounded-budget stop, not a crash —
+  # the agent did real work up to the turn cap. We treat that as partial
+  # success (rc forced to 0) so subsequent runs continue from the
+  # remaining inbox files instead of repeatedly retrying a failing phase.
+  local cost="0" terminal_reason=""
+  if [ -s "$output_json" ]; then
+    local parsed
+    parsed=$(OUTJSON="$output_json" python3 - <<'PYEOF' 2>/dev/null
+import json, os
+try:
+    d = json.load(open(os.environ["OUTJSON"]))
+    print(f"{d.get('total_cost_usd', 0)}|{d.get('terminal_reason', '')}")
+except Exception:
+    print("0|")
+PYEOF
+)
+    cost="${parsed%|*}"
+    terminal_reason="${parsed#*|}"
+    record_cost_actual 4 "$MODEL_SONNET" "${cost:-0}"
+    log "   ${_C_GREEN}✓${_C_RESET} actual cost: \$$cost"
+  else
+    log "   ${_C_YELLOW}!${_C_RESET} no JSON output captured; cost not recorded"
+    record_cost_actual 4 "$MODEL_SONNET" "0"
+  fi
+
+  if [ "$rc" -ne 0 ] && [ "$terminal_reason" = "max_turns" ]; then
+    log "   ${_C_YELLOW}!${_C_RESET} agent hit max-turns budget (work bounded; next run continues)"
+    return 0
+  fi
+
+  return $rc
+}
+
+# ─── Phase 2: Granola pull ───────────────────────────────────────────────────
+phase_2_granola() {
+  print_phase_header 2 "Granola pull"
+  begin_phase 2
+
+  if [ "$NO_GRANOLA" = "1" ]; then
+    log "   ${_C_DIM}↷ skipped (--no-granola)${_C_RESET}"
+    end_phase 2 skipped "--no-granola"
+    return 0
+  fi
+
+  if [ ! -x "$GRANOLA_BIN" ]; then
+    log "   ${_C_YELLOW}!${_C_RESET} granola binary not executable: $GRANOLA_BIN"
+    end_phase 2 skipped "binary missing"
+    return 0
+  fi
+
+  # Snapshot inbox before run
+  local inbox_dir="$BRAIN_DIR/inbox"
+  mkdir -p "$inbox_dir"
+  local before_list before_count
+  before_list=$(find "$inbox_dir" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null \
+    | xargs -n1 basename 2>/dev/null | sort)
+  # `grep -c` always prints the count to stdout (even 0); never fall back via ||.
+  before_count=$(printf "%s\n" "$before_list" | grep -c '\.md$')
+
+  log "   ${_C_DIM}▸${_C_RESET} running $GRANOLA_BIN..."
+  local granola_log="$RUN_DIR/phase-2.log"
+  local granola_rc=0
+  if "$GRANOLA_BIN" >"$granola_log" 2>&1; then
+    granola_rc=0
+  else
+    granola_rc=$?
+  fi
+
+  # Snapshot inbox after run
+  local after_list after_count new_files new_count
+  after_list=$(find "$inbox_dir" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null \
+    | xargs -n1 basename 2>/dev/null | sort)
+  after_count=$(printf "%s\n" "$after_list" | grep -c '\.md$')
+  new_files=$(comm -23 <(printf "%s\n" "$after_list") <(printf "%s\n" "$before_list") 2>/dev/null \
+    | grep '\.md$' || true)
+  new_count=$(printf "%s\n" "$new_files" | grep -c '\.md$')
+
+  echo "$new_count" > "$RUN_DIR/phase-2.metric.new_files"
+
+  if [ "$granola_rc" -ne 0 ]; then
+    log "   ${_C_RED}✗${_C_RESET} granola exit $granola_rc (see phase-2.log)"
+    end_phase 2 failed
+    return 1
+  fi
+
+  if [ "$new_count" -gt 0 ]; then
+    log "   ${_C_GREEN}✓${_C_RESET} $new_count new meeting file(s) in inbox/"
+    printf "%s\n" "$new_files" | head -5 | sed 's|^|     - |' | tee -a "$RUN_LOG" >/dev/null
+  else
+    log "   ${_C_GREEN}✓${_C_RESET} no new meetings (inbox unchanged: $after_count file(s))"
+  fi
+
+  end_phase 2 succeeded
+}
+
+phase_5_gbrain_dream() {
+  print_phase_header 5 "gbrain mechanical dream"
+  begin_phase 5
+
+  if [ "$NO_DREAM_MECH" = "1" ]; then
+    log "   ${_C_DIM}↷ skipped (--no-dream-mech)${_C_RESET}"
+    end_phase 5 skipped "--no-dream-mech"
+    return 0
+  fi
+
+  if [ ! -x "$GBRAIN_BIN" ]; then
+    log "   ${_C_YELLOW}!${_C_RESET} gbrain binary not executable: $GBRAIN_BIN"
+    end_phase 5 skipped "binary missing"
+    return 0
+  fi
+
+  local params
+  params=$(printf '{"cmd":"%s dream --json","cwd":"%s"}' "$GBRAIN_BIN" "$BRAIN_DIR")
+
+  log "   ${_C_DIM}▸${_C_RESET} submitting dream job (timeout 15min)..."
+  local phase_log="$RUN_DIR/phase-5.log"
+
+  # Run; capture output to phase-5.log and append to run.log. Use a real file
+  # rather than `tee | tee` so we get a clean exit code via $? without
+  # zsh-vs-bash pipestatus differences.
+  #
+  # GBRAIN_ALLOW_SHELL_JOBS=1 is REQUIRED on the worker process — the CLI flag
+  # `--allow-shell-jobs` only configures the supervisor, not the inline worker
+  # that --follow spawns. brain-eod has the same export. Without this, jobs are
+  # rejected with "shell handler disabled on this worker" and Phase 5 fails.
+  GBRAIN_ALLOW_SHELL_JOBS=1 "$GBRAIN_BIN" jobs submit shell \
+    --params "$params" \
+    --idempotency-key "dream-$RUN_ID" \
+    --follow \
+    --timeout-ms 900000 \
+    >"$phase_log" 2>&1
+  local rc=$?
+  cat "$phase_log" >> "$RUN_LOG" 2>/dev/null || true
+
+  if [ "$rc" -ne 0 ]; then
+    log "   ${_C_RED}✗${_C_RESET} gbrain dream exit $rc (see phase-5.log)"
+    end_phase 5 failed
+    return 1
+  fi
+
+  # Best-effort metric extraction from gbrain dream's JSON output.
+  # Real gbrain dream emits JSON; in tests with /usr/bin/true the file is empty.
+  local synced backlinks orphans
+  synced=$(grep -oE '"synced"[^,}]*' "$phase_log" 2>/dev/null | head -1 | tr -dc '0-9' || true)
+  backlinks=$(grep -oE '"backlinks"[^,}]*' "$phase_log" 2>/dev/null | head -1 | tr -dc '0-9' || true)
+  orphans=$(grep -oE '"orphans"[^,}]*' "$phase_log" 2>/dev/null | head -1 | tr -dc '0-9' || true)
+
+  if [ -n "$synced" ] || [ -n "$backlinks" ] || [ -n "$orphans" ]; then
+    log "   ${_C_GREEN}✓${_C_RESET} synced=${synced:-?}, backlinks=${backlinks:-?}, orphans=${orphans:-?}"
+  else
+    log "   ${_C_GREEN}✓${_C_RESET} dream complete (no metrics parsed from output)"
+  fi
+
+  end_phase 5 succeeded
+}
+
+phase_7_backup() {
+  print_phase_header 7 "Backup"
+  begin_phase 7
+
+  if [ "$NO_PUSH" = "1" ]; then
+    log "   ${_C_DIM}↷ skipped (--no-push)${_C_RESET}"
+    end_phase 7 skipped "--no-push"
+    return 0
+  fi
+
+  if ! cd "$BRAIN_DIR"; then
+    log "   ${_C_RED}✗${_C_RESET} cannot cd to $BRAIN_DIR"
+    end_phase 7 failed
+    return 1
+  fi
+
+  git add . >>"$RUN_LOG" 2>&1
+  local staged
+  staged=$(git diff --cached --name-only | wc -l | tr -d ' ')
+  echo "$staged" > "$RUN_DIR/phase-7.metric.staged_files"
+
+  if [ "$staged" -eq 0 ]; then
+    log "   ${_C_GREEN}✓${_C_RESET} nothing to commit"
+    end_phase 7 succeeded
+    return 0
+  fi
+
+  if ! git commit -m "brain-run $RUN_ID — $staged file(s)" >>"$RUN_LOG" 2>&1; then
+    log "   ${_C_RED}✗${_C_RESET} git commit failed"
+    end_phase 7 failed
+    return 1
+  fi
+
+  if ! git push >>"$RUN_LOG" 2>&1; then
+    log "   ${_C_RED}✗${_C_RESET} git push failed"
+    end_phase 7 failed
+    return 1
+  fi
+
+  log "   ${_C_GREEN}✓${_C_RESET} committed + pushed $staged file(s) to origin"
+  end_phase 7 succeeded
+}
+
+phase_8_verify() {
+  print_phase_header 8 "Verification"
+  begin_phase 8
+
+  if [ ! -x "$GBRAIN_BIN" ]; then
+    log "   ${_C_YELLOW}!${_C_RESET} gbrain not executable; skipping"
+    end_phase 8 skipped "binary missing"
+    return 0
+  fi
+
+  "$GBRAIN_BIN" doctor --json > "$RUN_DIR/phase-8.doctor.json" 2>&1 || true
+  "$GBRAIN_BIN" stats > "$RUN_DIR/phase-8.stats.txt" 2>&1 || true
+  "$GBRAIN_BIN" jobs list --status active > "$RUN_DIR/phase-8.active-jobs.txt" 2>&1 || true
+
+  local summary
+  summary=$(RUN_DIR="$RUN_DIR" python3 - <<'PYEOF' 2>/dev/null
+import json, os
+try:
+    d = json.load(open(os.environ["RUN_DIR"] + "/phase-8.doctor.json"))
+    status = d.get("status", "?")
+    checks = d.get("checks", []) if isinstance(d.get("checks"), list) else []
+    ok = sum(1 for c in checks if c.get("status") == "ok")
+    warn = sum(1 for c in checks if c.get("status") == "warn")
+    fail = sum(1 for c in checks if c.get("status") == "fail")
+    print(f"doctor: {status} ({ok} ok / {warn} warn / {fail} fail)")
+except Exception:
+    pass
+PYEOF
+)
+
+  if [ -n "$summary" ]; then
+    log "   ${_C_GREEN}✓${_C_RESET} $summary"
+  else
+    log "   ${_C_GREEN}✓${_C_RESET} verification commands ran (no doctor JSON to parse)"
+  fi
+
+  end_phase 8 succeeded
+}
+
+# ─── Phase 9: Summary report ─────────────────────────────────────────────────
+# Phase 9 only marks itself succeeded + announces the path. The actual render
+# happens in on_exit() so the report can show Phase 9 = succeeded (cosmetic
+# fix: rendering inside Phase 9 itself would always show status=started).
+phase_9_summary() {
+  print_phase_header 9 "Summary report"
+  begin_phase 9
+
+  local report="$REPORT_DIR/run-$RUN_ID.md"
+  mkdir -p "$REPORT_DIR"
+  log "   ${_C_GREEN}✓${_C_RESET} report path: $report (rendered at exit)"
+  end_phase 9 succeeded
+}
+
+render_summary_report() {
+  local report="$REPORT_DIR/run-$RUN_ID.md"
+  mkdir -p "$REPORT_DIR"
+  REPORT_OUT="$report" python3 - <<'PYEOF'
+import json, os, time
+m = json.load(open(os.environ["MANIFEST"]))
+phases = m.get("phases", {})
+# Backfill Phase 9's duration: it's set to 0 by end_phase because rendering
+# moved to the trap. Compute true duration from the begin_phase epoch.
+_p9_t0 = int(os.environ.get("P_T0_9", "0") or "0")
+if _p9_t0 > 0 and "9" in phases:
+    phases["9"]["duration_s"] = max(int(time.time()) - _p9_t0,
+                                     phases["9"].get("duration_s", 0))
+    m["totals"]["duration_s"] = sum(p.get("duration_s", 0) for p in phases.values())
+    json.dump(m, open(os.environ["MANIFEST"], "w"), indent=2)
+phase_names = {
+    "0": "Preflight", "1": "Git safety", "2": "Granola pull",
+    "3": "Cal-mail sync", "4": "Inbox & enrich", "5": "gbrain dream",
+    "6": "Opus synthesis", "7": "Backup", "8": "Verification",
+    "9": "Summary report",
+}
+status_glyph = {"succeeded": "✓", "skipped": "↷", "failed": "✗", "started": "…"}
+
+dollar = "$"
+lines = []
+lines.append(f"# Brain Run — {m['started_at']} (RUN_ID {m['run_id']})")
+lines.append("")
+lines.append(f"**Mode:** {m['mode']}    **Total cost:** {dollar}{m['totals']['cost_usd']:.2f}    **Duration:** {m['totals']['duration_s']}s")
+lines.append("")
+lines.append("## Phases")
+lines.append("")
+lines.append("| # | Phase            | Status     | Time | Cost   | Notes |")
+lines.append("|---|------------------|------------|------|--------|-------|")
+for n in ["0","1","2","3","4","5","6","7","8","9"]:
+    p = phases.get(n)
+    if not p:
+        lines.append(f"| {n} | {phase_names[n]:<16} | (not run)  |      |        |       |")
+        continue
+    s = p["status"]
+    g = status_glyph.get(s, "?")
+    notes = p.get("skip_reason") or ""
+    lines.append(f"| {n} | {phase_names[n]:<16} | {g} {s:<10} | {p['duration_s']:>3}s | {dollar}{p['cost_usd']:.2f} | {notes} |")
+lines.append("")
+lines.append("## Logs")
+lines.append("")
+lines.append(f"- Run log:    `{m['run_id']}/run.log`")
+lines.append(f"- Manifest:   `{m['run_id']}/manifest.json`")
+
+with open(os.environ["REPORT_OUT"], "w") as f:
+    f.write("\n".join(lines) + "\n")
+PYEOF
+  ln -sfn "$(basename "$report")" "$REPORT_DIR/latest.md"
+}
+
+# ─── Trap: finalize on exit ──────────────────────────────────────────────────
+on_exit() {
+  local rc="$1"
+  if [ -n "$MANIFEST" ] && [ -f "$MANIFEST" ]; then
+    EXIT_CODE="$rc" END_ISO="$(now_iso)" python3 - <<'PYEOF' 2>/dev/null || true
+import json, os
+mp = os.environ["MANIFEST"]
+m = json.load(open(mp))
+m["ended_at"] = os.environ["END_ISO"]
+m["exit_code"] = int(os.environ["EXIT_CODE"])
+json.dump(m, open(mp, "w"), indent=2)
+PYEOF
+    # Re-render the report now that manifest is final (Phase 9's status
+    # is committed and ended_at + exit_code are set).
+    render_summary_report 2>/dev/null || true
+
+    # Write the Automator-readable status file (Opus review item 5).
+    # Single-line lookups: jq -r .status, jq -r '.failed_phases | join(", ")'
+    write_last_run_status "$rc" 2>/dev/null || true
+  fi
+}
+
+# Writes ~/.gbrain/last-run.json with summary state for desktop notifications.
+# Automator can read this to surface "last run failed" without parsing the
+# full manifest or run.log.
+write_last_run_status() {
+  local rc="$1"
+  mkdir -p "$(dirname "$STATUS_FILE")"
+  EXIT_CODE="$rc" STATUS_FILE_OUT="$STATUS_FILE" REPORT_DIR="$REPORT_DIR" \
+  RUN_ID="$RUN_ID" python3 - <<'PYEOF'
+import json, os
+mp = os.environ["MANIFEST"]
+m = json.load(open(mp))
+phases = m.get("phases", {})
+
+failed = [n for n, p in phases.items() if p.get("status") == "failed"]
+exit_code = int(os.environ["EXIT_CODE"])
+
+if exit_code == 0 and not failed:
+    status = "succeeded"
+elif failed and exit_code != 0:
+    status = "failed"
+else:
+    status = "partial"  # phase failed but later phases continued (Phase 5 case)
+
+# First error: pull from the failed phase's log if available
+first_error = None
+if failed:
+    failed_n = failed[0]
+    log_path = os.path.dirname(mp) + f"/phase-{failed_n}.log"
+    if os.path.exists(log_path):
+        try:
+            with open(log_path) as f:
+                lines = [ln.rstrip() for ln in f if ln.strip()]
+                # Last non-empty line is usually the most informative
+                first_error = lines[-1][:240] if lines else None
+        except Exception:
+            pass
+
+s = {
+    "run_id": m.get("run_id"),
+    "status": status,
+    "exit_code": exit_code,
+    "started_at": m.get("started_at"),
+    "ended_at": m.get("ended_at"),
+    "duration_s": m.get("totals", {}).get("duration_s", 0),
+    "cost_usd": m.get("totals", {}).get("cost_usd", 0),
+    "failed_phases": [int(n) for n in failed],
+    "first_error": first_error,
+    "report_path": os.environ["REPORT_DIR"] + f"/run-{os.environ['RUN_ID']}.md",
+    "log_path": os.path.dirname(mp) + "/run.log",
+}
+
+with open(os.environ["STATUS_FILE_OUT"], "w") as f:
+    json.dump(s, f, indent=2)
+PYEOF
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+
+  # Set up run dir + log
+  RUN_DIR="$RUNS_DIR/$RUN_ID"
+  RUN_LOG="$RUN_DIR/run.log"
+  MANIFEST="$RUN_DIR/manifest.json"
+  RUN_STARTED_AT="$(now_iso)"
+  RUN_STARTED_EPOCH="$(now_epoch)"
+
+  mkdir -p "$RUN_DIR" "$REPORT_DIR" "$(dirname "$COST_LOG")"
+  : > "$RUN_LOG"  # truncate
+  ln -sfn "$RUN_ID" "$RUNS_DIR/latest"
+
+  trap 'on_exit $?' EXIT
+
+  log "═══════════════════════════════════════════════════════════════"
+  log "  🧠 brain-run — $(date '+%Y-%m-%d %H:%M') — RUN_ID $RUN_ID"
+  log "═══════════════════════════════════════════════════════════════"
+  log ""
+  log "Mode: $MODE  |  flags: ${PASSED_FLAGS[*]}"
+  log "Run dir: $RUN_DIR"
+
+  if [ "$DRY_RUN" = "1" ]; then
+    log ""
+    log "(--dry-run: not executing phases)"
+    return 0
+  fi
+
+  # Dispatch phases. Phase 0/1 always run. Phases 2/5/7/8 always (stubs).
+  # Phases 3/4 only on --weekly. Phase 6 only on --with-dream. Phase 9 always.
+  phase_0_preflight
+  phase_1_git_safety
+  phase_2_granola
+  phase_3_calmail
+  phase_4_inbox_enrich
+  phase_5_gbrain_dream
+  # Phase 6 — opus synthesis — not implemented
+  phase_7_backup
+  phase_8_verify
+  phase_9_summary
+
+  log ""
+  log "═══════════════════════════════════════════════════════════════"
+  if [ "$ANY_PHASE_FAILED" = "1" ]; then
+    log "  ${_C_YELLOW}⚠${_C_RESET}  brain-run complete with failures — RUN_ID $RUN_ID"
+    log "     see report for details. exiting 1."
+  else
+    log "  ${_C_GREEN}✅${_C_RESET} brain-run complete — RUN_ID $RUN_ID"
+  fi
+  log "═══════════════════════════════════════════════════════════════"
+
+  # Honest exit code: non-zero if any phase failed, even if we ran later
+  # phases (Phase 7 backup is best-effort even after Phase 5 fails so we
+  # don't lose work). Spec §6: "Supabase down (Phase 5/8) → succeeded-with-
+  # warning, backup still runs"; runtime signals failure via exit code.
+  if [ "$ANY_PHASE_FAILED" = "1" ]; then
+    return 1
+  fi
+  return 0
+}
+
+# Skip main() when sourced as a library (e.g., by unit tests of record_cost).
+if [ "$BRAIN_RUN_LIB_MODE" != "1" ]; then
+  main "$@"
+  exit $?
+fi

@@ -1,0 +1,339 @@
+#!/bin/zsh
+# brain-eod — manual end-of-day runner.
+#
+# Chains: ensure supervisor → granola pull → dream cycle → backup → baton.
+# Deterministic work runs as Minions shell jobs through the supervisor.
+# LLM-driven enrichment is queued in a baton file at ~/brain/.tasks/ for
+# you to execute in Claude Code with the right model tier.
+#
+# One-liner:  brain-eod
+# Logs:       ~/.gbrain/eod-runs/eod-YYYY-MM-DD.log
+# Baton:      ~/brain/.tasks/eod-YYYY-MM-DD.md
+
+set -uo pipefail   # NOT -e; we want to continue past per-step idempotency exits
+
+# ─── Paths & env ──────────────────────────────────────────────────────────────
+export PATH=$HOME/.bun/bin:$HOME/.local/bin:$PATH
+# Required for shell-job execution (flag-only is unreliable; --follow spawns an
+# inline worker that only respects the env var, not the CLI flag).
+export GBRAIN_ALLOW_SHELL_JOBS=1
+
+DATE=$(date +%Y-%m-%d)
+TIMESTAMP=$(date +%Y-%m-%dT%H:%M:%S%z)
+# RUN_ID is per-invocation so jobs aren't blocked by previous failed
+# submissions caching their failure under a per-day key. Same-second
+# double invocations would collide harmlessly.
+RUN_ID=$(date +%Y%m%dT%H%M%S)
+BRAIN_DIR=$HOME/brain
+TASKS_DIR=$BRAIN_DIR/.tasks
+BATON=$TASKS_DIR/eod-$DATE.md
+RUN_LOG_DIR=$HOME/.gbrain/eod-runs
+RUN_LOG=$RUN_LOG_DIR/eod-$DATE.log
+GBRAIN=$HOME/.bun/bin/gbrain
+GRANOLA_BIN=$HOME/bin/granola-to-brain
+
+mkdir -p "$TASKS_DIR" "$RUN_LOG_DIR"
+
+# Tee everything to log file
+exec > >(tee -a "$RUN_LOG") 2>&1
+
+echo "═══════════════════════════════════════"
+echo "  🌙 brain-eod — $TIMESTAMP"
+echo "═══════════════════════════════════════"
+
+# ─── 1/6 Supervisor ───────────────────────────────────────────────────────────
+echo ""
+echo "[1/6] Supervisor health..."
+SUPERVISOR_STATE="unknown"
+SUPERVISOR_PID=""
+TMUX_SESSION="brain-supervisor"
+
+# Reliable status check: status --json always exits 0; parse the running field.
+sup_running() {
+  "$GBRAIN" jobs supervisor status --json 2>/dev/null \
+    | python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin)
+    sys.exit(0 if d.get('running') else 1)
+except Exception:
+    sys.exit(2)"
+}
+
+if sup_running; then
+  SUPERVISOR_STATE="already_running"
+  SUPERVISOR_PID=$("$GBRAIN" jobs supervisor status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('supervisor_pid',''))" 2>/dev/null || echo "")
+  echo "   ✓ supervisor already running (pid $SUPERVISOR_PID)"
+else
+  # Kill any stale tmux session before starting a fresh one
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "   ⏵ stale tmux session '$TMUX_SESSION' detected — killing"
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+  fi
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    SUPERVISOR_STATE="failed_no_tmux"
+    echo "   ✗ tmux not installed — install via 'brew install tmux'"
+  else
+    echo "   ⏵ starting supervisor in tmux session '$TMUX_SESSION'..."
+    tmux new-session -d -s "$TMUX_SESSION" "$GBRAIN jobs supervisor start --allow-shell-jobs"
+    sleep 3  # let supervisor initialize + write pid file
+
+    if sup_running; then
+      SUPERVISOR_PID=$("$GBRAIN" jobs supervisor status --json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('supervisor_pid',''))" 2>/dev/null || echo "")
+      SUPERVISOR_STATE="started_now"
+      echo "   ✓ supervisor started in tmux session '$TMUX_SESSION' (pid $SUPERVISOR_PID)"
+      echo "   ℹ  attach to watch: tmux attach -t $TMUX_SESSION"
+    else
+      SUPERVISOR_STATE="failed_to_start"
+      echo "   ✗ supervisor failed to start — check tmux session '$TMUX_SESSION':"
+      tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null | tail -20 || echo "   (no tmux output)"
+    fi
+  fi
+fi
+
+# ─── 2/6 Granola pull (via Minions shell job) ─────────────────────────────────
+echo ""
+echo "[2/6] Granola pull (Minions shell job)..."
+
+# Snapshot inbox so we can diff for new files
+INBOX_BEFORE_LIST=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | xargs -n1 basename 2>/dev/null | sort)
+INBOX_BEFORE_COUNT=$(echo "$INBOX_BEFORE_LIST" | grep -c '\.md$' || true)
+
+GRANOLA_RC=0
+if [ -x "$GRANOLA_BIN" ]; then
+  GRANOLA_PARAMS=$(printf '{"cmd":"%s","cwd":"%s"}' "$GRANOLA_BIN" "$HOME")
+  "$GBRAIN" jobs submit shell \
+      --params "$GRANOLA_PARAMS" \
+      --idempotency-key "granola-$RUN_ID" \
+      --follow \
+      --timeout-ms 120000 \
+      2>&1 | tail -20 || GRANOLA_RC=$?
+  echo "   granola job exit: $GRANOLA_RC"
+else
+  GRANOLA_RC=127
+  echo "   ⚠ $GRANOLA_BIN not found, skipping"
+fi
+
+INBOX_AFTER_LIST=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | xargs -n1 basename 2>/dev/null | sort)
+INBOX_AFTER_COUNT=$(echo "$INBOX_AFTER_LIST" | grep -c '\.md$' || true)
+NEW_INBOX_FILES=$(comm -23 <(echo "$INBOX_AFTER_LIST") <(echo "$INBOX_BEFORE_LIST") | grep '\.md$' || true)
+NEW_INBOX_COUNT=$(echo "$NEW_INBOX_FILES" | grep -c '\.md$' || true)
+
+# ─── 3/6 Dream cycle (via Minions shell job) ──────────────────────────────────
+echo ""
+echo "[3/6] Dream cycle (Minions shell job; lint, backlinks, sync, extract, embed, orphans)..."
+
+DREAM_PARAMS=$(printf '{"cmd":"%s dream --json","cwd":"%s"}' "$GBRAIN" "$BRAIN_DIR")
+DREAM_RC=0
+"$GBRAIN" jobs submit shell \
+    --params "$DREAM_PARAMS" \
+    --idempotency-key "dream-$RUN_ID" \
+    --follow \
+    --timeout-ms 900000 \
+    2>&1 | tee /tmp/.eod-dream.log | tail -30 || DREAM_RC=$?
+echo "   dream job exit: $DREAM_RC"
+
+# Try to pull a small summary out of the dream output if it's there
+DREAM_SUMMARY=$(grep -E "lint|backlinks|extract|embed|orphan|complete" /tmp/.eod-dream.log 2>/dev/null | tail -10 || echo "")
+
+# ─── 4/6 Backup (git push of brain repo) ──────────────────────────────────────
+echo ""
+echo "[4/6] Backup (git push ~/brain)..."
+cd "$BRAIN_DIR"
+git add -A
+STAGED=$(git diff --cached --name-only | wc -l | tr -d ' ')
+PUSH_RESULT=""
+if [ "$STAGED" -gt 0 ]; then
+  if git commit -m "eod backup — $DATE" >/dev/null 2>&1; then
+    if git push >/dev/null 2>&1; then
+      PUSH_RESULT="pushed $STAGED file(s) to origin"
+      echo "   ✓ $PUSH_RESULT"
+    else
+      PUSH_RESULT="committed $STAGED but push failed"
+      echo "   ⚠ $PUSH_RESULT"
+    fi
+  else
+    PUSH_RESULT="nothing to commit (post-add)"
+    echo "   ✓ $PUSH_RESULT"
+  fi
+else
+  PUSH_RESULT="nothing to commit"
+  echo "   ✓ $PUSH_RESULT"
+fi
+
+# ─── 5/6 Verification ─────────────────────────────────────────────────────────
+echo ""
+echo "[5/6] Verification..."
+
+# doctor
+"$GBRAIN" doctor --json 2>/dev/null > /tmp/.eod-doctor.json || true
+DOCTOR_INFO=$(python3 -c "
+import json
+try:
+    d = json.load(open('/tmp/.eod-doctor.json'))
+    status = d.get('status', '?')
+    checks = d.get('checks', [])
+    ok = sum(1 for c in checks if c['status'] == 'ok')
+    warn = sum(1 for c in checks if c['status'] == 'warn')
+    fail = sum(1 for c in checks if c['status'] == 'fail')
+    bad = [c['name'] for c in checks if c['status'] in ('warn','fail')]
+    print(f'{status}|{ok}|{warn}|{fail}|' + (', '.join(bad) if bad else '(none)'))
+except Exception as e:
+    print(f'?|0|0|0|(parse error: {e})')
+" 2>/dev/null || echo "?|0|0|0|(parse error)")
+DOCTOR_STATUS=$(echo "$DOCTOR_INFO" | cut -d'|' -f1)
+DOCTOR_OK=$(echo "$DOCTOR_INFO" | cut -d'|' -f2)
+DOCTOR_WARN=$(echo "$DOCTOR_INFO" | cut -d'|' -f3)
+DOCTOR_FAIL=$(echo "$DOCTOR_INFO" | cut -d'|' -f4)
+DOCTOR_WARNINGS=$(echo "$DOCTOR_INFO" | cut -d'|' -f5)
+SCORE="$DOCTOR_OK ok / $DOCTOR_WARN warn / $DOCTOR_FAIL fail"
+
+# stats (strip the [gbrain] prefix line)
+STATS=$("$GBRAIN" stats 2>&1 | grep -v "^\[gbrain\]" || echo "")
+
+# active jobs
+ACTIVE_JOBS=$("$GBRAIN" jobs list --status active 2>&1 | grep -v "^\[gbrain\]" || echo "")
+
+echo "   doctor: $DOCTOR_STATUS — $SCORE"
+echo "   warnings/fails: $DOCTOR_WARNINGS"
+
+# ─── 6/6 Build baton ──────────────────────────────────────────────────────────
+echo ""
+echo "[6/6] Generating baton: $BATON"
+
+# Tier 1 entities — hard-coded from CLAUDE.md
+TIER1_LIST="companies/centrica
+companies/anthro-energy
+companies/green-li-ion
+companies/blixt
+companies/immaterial
+companies/redoxion
+people/peter-robson
+people/george-vives-rouco
+people/chris-oshea"
+
+# Build "new inbox files" markdown bullets
+if [ -n "$NEW_INBOX_FILES" ] && [ "$NEW_INBOX_COUNT" -gt 0 ]; then
+  NEW_INBOX_BULLETS=$(echo "$NEW_INBOX_FILES" | sed 's|^|  - `~/brain/inbox/|; s|$|`|')
+else
+  NEW_INBOX_BULLETS="  - (none — Granola brought no new meetings; existing inbox carries over)"
+fi
+
+# Existing inbox files (not new today, but still need filing)
+EXISTING_INBOX_BULLETS=""
+if [ "$INBOX_AFTER_COUNT" -gt 0 ]; then
+  EXISTING_INBOX_BULLETS=$(echo "$INBOX_AFTER_LIST" | grep '\.md$' | sed 's|^|  - `~/brain/inbox/|; s|$|`|')
+fi
+
+# Tier 1 bullets
+TIER1_BULLETS=$(echo "$TIER1_LIST" | sed 's|^|  - `|; s|$|`|')
+
+cat > "$BATON" <<EOF
+# End of Day — $DATE
+
+> Baton from \`brain-eod\` automated runner. Read this in Claude Code at end-of-day to finish the LLM-driven enrichment that the script can't do deterministically.
+
+## Run Summary
+
+- **Started:** $TIMESTAMP
+- **Supervisor:** $SUPERVISOR_STATE${SUPERVISOR_PID:+ (pid $SUPERVISOR_PID)}
+- **Granola pull:** exit $GRANOLA_RC, $NEW_INBOX_COUNT new meeting(s)
+- **Dream cycle:** exit $DREAM_RC
+- **Backup:** $PUSH_RESULT
+- **Doctor:** $DOCTOR_STATUS — $SCORE (issues: $DOCTOR_WARNINGS)
+- **Run log:** \`$RUN_LOG\`
+
+---
+
+## ✅ Done Automatically (deterministic)
+
+1. **Supervisor:** $SUPERVISOR_STATE
+2. **Granola → inbox:** $NEW_INBOX_COUNT new file(s)
+$NEW_INBOX_BULLETS
+3. **Dream cycle:** lint, backlinks, sync, extract, embed, orphans (\`gbrain dream --json\`)
+4. **Backup:** $PUSH_RESULT
+5. **Doctor & stats:** captured below
+
+---
+
+## 🔵 Haiku — quick checks (1-2 min)
+
+Light retrieval, no reasoning. Cheap and fast — just glance and move on.
+
+- [ ] \`gbrain stats\` — confirm page count is what you expect
+- [ ] \`gbrain query "today" --no-expand\` — surface what the brain saw today
+- [ ] Doctor warnings remaining: $DOCTOR_WARNINGS
+
+**Trigger in Claude Code:**
+\`\`\`
+🔵 HAIKU — glance at brain stats and today's activity per ~/brain/.tasks/eod-$DATE.md
+\`\`\`
+
+---
+
+## 🟡 Sonnet — enrichment & filing ($INBOX_AFTER_COUNT inbox file(s) need attention)
+
+Default tier for filing, enrichment, drafting, summarizing.
+
+- [ ] **File inbox items** into final destinations (meetings/, people/, companies/, etc.):
+$EXISTING_INBOX_BULLETS
+- [ ] **Enrich any new entities** that came up in today's inbox (people/companies referenced)
+- [ ] **Daily brief** — what happened today, what needs follow-up tomorrow
+- [ ] **Backlink fixes** if dream surfaced any stragglers (check run log)
+
+**Trigger in Claude Code:**
+\`\`\`
+🟡 SONNET — process inbox items and enrich per ~/brain/.tasks/eod-$DATE.md
+\`\`\`
+
+---
+
+## 🔴 Opus — heavy synthesis (REQUIRES YOUR EXPLICIT APPROVAL — \$\$ tier)
+
+Only fires when you actively decide. Per CLAUDE.md tier rules: state cost first, wait for "go".
+
+- [ ] **Tier-1 entity refresh** (LP / portfolio anchors). Review which had activity today and whether they warrant Opus rewrite:
+$TIER1_BULLETS
+- [ ] **Compiled-truth rewriting** — for pages with significant new timeline activity (manual judgment; default skip unless flagged)
+- [ ] **Cross-document synthesis** — e.g., "what's the through-line across this week's ERV meetings"
+- [ ] **Dream-cycle deep mode** — only if dream auto-cycle surfaced something requiring multi-page synthesis
+
+**Trigger in Claude Code (only after explicit go):**
+\`\`\`
+🔴 OPUS — tier-1 refresh for [list specific slugs] per ~/brain/.tasks/eod-$DATE.md
+                Estimated cost ~\$X — confirm before proceeding.
+\`\`\`
+
+---
+
+## Verification snapshot
+
+### Stats
+\`\`\`
+$STATS
+\`\`\`
+
+### Doctor warnings/fails
+$DOCTOR_WARNINGS
+
+### Active jobs (should be empty after eod)
+\`\`\`
+$ACTIVE_JOBS
+\`\`\`
+
+---
+
+*Generated by \`~/bin/brain-eod\` at $TIMESTAMP. Re-run anytime — same-day idempotent (Minions \`--idempotency-key\` per phase).*
+EOF
+
+echo "   ✓ baton written"
+
+# ─── Done ─────────────────────────────────────────────────────────────────────
+echo ""
+echo "═══════════════════════════════════════"
+echo "  ✅ brain-eod complete — $(date +%H:%M)"
+echo "  📋 Baton: $BATON"
+echo "  📜 Log:   $RUN_LOG"
+echo "═══════════════════════════════════════"
+
+osascript -e "display notification \"$DATE eod complete — $DOCTOR_STATUS ($SCORE)\" with title \"🌙 brain-eod\" sound name \"Glass\"" 2>/dev/null || true

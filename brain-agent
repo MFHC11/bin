@@ -1,0 +1,5 @@
+#!/bin/zsh
+source ~/.zshrc
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+cd /Users/marcusclover/brain
+claude --model claude-haiku-4-5

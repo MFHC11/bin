@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+granola-to-brain: Import Granola meetings into gbrain inbox.
+
+Fetches meetings from the last 7 days, formats as gbrain-compatible markdown,
+and saves to /Users/marcusclover/brain/inbox/ with automatic deduplication.
+
+Supports:
+  --dry-run, -n      Show what would be imported without writing files
+  --force            Override duplicate checking and import anyway
+"""
+
+import os
+import sys
+import json
+import subprocess
+from datetime import datetime, timedelta
+from pathlib import Path
+import re
+
+GRANOLA_SCRIPT = os.path.expanduser("~/.claude/skills/granola/scripts/granola.py")
+# Granola meetings land directly in meetings/granola/ — already rich (transcript +
+# attendees + summary), no triage needed. The 9 AM cron's enrichment pass picks
+# them up.
+BRAIN_INBOX = Path(os.path.expanduser("~/brain/meetings/granola"))
+BRAIN_ROOT = Path(os.path.expanduser("~/brain"))
+LOG_DIR = Path(os.path.expanduser("~/.gbrain"))
+IMPORT_LOG = LOG_DIR / "granola-imported.log"
+
+DRY_RUN = "--dry-run" in sys.argv or "-n" in sys.argv
+FORCE = "--force" in sys.argv
+
+
+def run_cmd(cmd):
+    """Run shell command and return output."""
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return result.stdout, result.stderr, result.returncode
+
+
+def get_granola_meetings():
+    """Fetch all Granola meetings from the last 7 days."""
+    cmd = f"python3 {GRANOLA_SCRIPT} list --format json 2>/dev/null"
+    stdout, stderr, code = run_cmd(cmd)
+    if code != 0:
+        print(f"Error fetching Granola meetings: {stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        print("Error parsing Granola JSON output", file=sys.stderr)
+        sys.exit(1)
+
+    cutoff = datetime.now() - timedelta(days=7)
+    recent = [m for m in data['meetings'] if datetime.fromisoformat(m['date']) >= cutoff]
+    return sorted(recent, key=lambda m: m['date'], reverse=True)
+
+
+def get_transcript(meeting_id):
+    """Fetch transcript for a meeting by ID."""
+    cmd = f"python3 {GRANOLA_SCRIPT} transcript {meeting_id} 2>/dev/null"
+    stdout, stderr, code = run_cmd(cmd)
+    if code != 0:
+        return []
+
+    lines = stdout.strip().split('\n')
+    utterances = []
+    for line in lines:
+        if line.strip():
+            utterances.append(line)
+    return utterances
+
+
+def slugify(text):
+    """Convert text to slug for filename."""
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s-]', '', text)
+    text = re.sub(r'[-\s]+', '-', text)
+    return text.strip('-')
+
+
+def generate_tags(meeting):
+    """Auto-generate tags from attendees and title."""
+    tags = set()
+
+    title_lower = meeting['title'].lower()
+    keywords = ['erv', 'blixt', 'fund', 'fundraising', 'onboarding', 'catch-up',
+                'prep', 'exco', 'ops', 'meeting', 'call']
+    for kw in keywords:
+        if kw in title_lower:
+            tags.add(kw)
+
+    important_people = ['peter robson', 'chris o\'shea', 'sergio delgado', 'nick grossman',
+                       'sofia', 'guillaume', 'hayden', 'marcus']
+    for person in important_people:
+        if any(person.lower() in attendee.lower() for attendee in meeting['attendees']):
+            parts = person.split()
+            tags.add(parts[-1].lower())
+
+    if '[EXTERNAL]' in meeting['title'] or 'external' in title_lower:
+        tags.add('external')
+
+    tags.discard('meeting')
+    tags.discard('call')
+
+    return sorted(list(tags))
+
+
+def summarize_transcript(utterances, title, attendees):
+    """Create a quick one-paragraph summary of the meeting."""
+    if not utterances:
+        return f"Meeting: {title} with {len(attendees)} attendees."
+
+    text = '\n'.join(utterances)
+    lines_lower = text.lower()
+    has_decision = any(word in lines_lower for word in ['decision', 'agreed', 'decided'])
+    has_update = any(word in lines_lower for word in ['update', 'status', 'progress'])
+    has_action = any(word in lines_lower for word in ['action', 'next', 'follow-up', 'need to'])
+
+    summary_parts = [f"{title} with {len(attendees)} attendee(s): {', '.join(attendees[:3])}"]
+
+    if has_decision:
+        summary_parts.append("Key decisions were made.")
+    if has_update:
+        summary_parts.append("Status updates discussed.")
+    if has_action:
+        summary_parts.append("Action items identified.")
+
+    if len(utterances) > 50:
+        summary_parts.append(f"({len(utterances)} utterances in transcript)")
+
+    return ' '.join(summary_parts)
+
+
+def extract_action_items(utterances):
+    """Extract potential action items from transcript."""
+    actions = []
+
+    if not utterances:
+        return actions
+
+    text = '\n'.join(utterances)
+    action_patterns = [
+        r'(?:need to|have to|should|must|will|can you|could you|please).*?[.!?]',
+        r'(?:action|todo|follow.?up|next.*?step).*?[.!?]',
+        r'(?:send|email|prepare|update|check).*?[.!?]',
+    ]
+
+    for pattern in action_patterns:
+        matches = re.finditer(pattern, text, re.IGNORECASE)
+        for match in matches:
+            item = match.group(0).strip()
+            if len(item) < 120:
+                actions.append(item)
+
+    return list(set(actions))[:5]
+
+
+def read_import_log():
+    """Read the log of previously imported granola_ids."""
+    if not IMPORT_LOG.exists():
+        return set()
+
+    imported = set()
+    try:
+        with open(IMPORT_LOG, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    imported.add(line)
+    except (IOError, OSError):
+        pass
+    return imported
+
+
+def write_import_log(granola_id):
+    """Append a granola_id to the import log."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(IMPORT_LOG, 'a') as f:
+            f.write(f"{granola_id}\n")
+    except (IOError, OSError) as e:
+        print(f"Warning: Could not write import log: {e}", file=sys.stderr)
+
+
+def granola_id_exists_in_brain(granola_id):
+    """Check if granola_id already exists anywhere in the brain."""
+    cmd = f"grep -r 'granola_id: {granola_id}' {BRAIN_ROOT} 2>/dev/null"
+    stdout, stderr, code = run_cmd(cmd)
+    return code == 0
+
+
+def check_by_date_and_attendees(meeting):
+    """Check if a meeting with same date and attendees already exists."""
+    if not meeting['attendees']:
+        return False
+
+    meeting_date = meeting['date']
+    # Create a pattern with first attendee name
+    first_attendee = meeting['attendees'][0].split()[0] if meeting['attendees'] else ''
+
+    if not first_attendee:
+        return False
+
+    # Search for files with matching date
+    cmd = f"grep -r 'date: {meeting_date}' {BRAIN_ROOT} 2>/dev/null | head -20"
+    stdout, stderr, code = run_cmd(cmd)
+
+    if code == 0 and stdout:
+        # Found matches on same date, check attendee overlap
+        for line in stdout.strip().split('\n'):
+            if 'attendees:' in line:
+                # Extract attendees from this line
+                try:
+                    attendee_part = line.split('attendees:')[1]
+                    for attendee in meeting['attendees']:
+                        if attendee.lower() in attendee_part.lower():
+                            return True
+                except (IndexError, ValueError):
+                    pass
+    return False
+
+
+def meeting_exists(meeting):
+    """Check if meeting already exists using multiple methods."""
+    if FORCE:
+        return False
+
+    # Method 1: Check import log first (fastest)
+    imported = read_import_log()
+    if meeting['id'] in imported:
+        return True
+
+    # Method 2: Check if granola_id already in brain (exact match)
+    if granola_id_exists_in_brain(meeting['id']):
+        return True
+
+    # Method 3: Check by date + attendees combination
+    if check_by_date_and_attendees(meeting):
+        return True
+
+    # Method 4: Check by filename in inbox (legacy check)
+    filename = f"{meeting['date']}-{slugify(meeting['title'])}.md"
+    filepath = BRAIN_INBOX / filename
+    if filepath.exists():
+        return True
+
+    return False
+
+
+def format_meeting(meeting):
+    """Format a meeting as gbrain markdown."""
+    transcript = get_transcript(meeting['id'])
+    tags = generate_tags(meeting)
+    summary = summarize_transcript(transcript, meeting['title'], meeting['attendees'])
+    action_items = extract_action_items(transcript)
+
+    start = meeting.get('start', '?')
+    end = meeting.get('end', '?')
+    duration_str = f"{start}-{end}" if start != '?' and end != '?' else "?"
+
+    frontmatter = f"""---
+type: meeting
+date: {meeting['date']}
+attendees: {', '.join(meeting['attendees']) if meeting['attendees'] else '[no attendees]'}
+duration: {duration_str}
+tags: {json.dumps(tags)}
+source: granola
+granola_id: {meeting['id']}
+---"""
+
+    content = f"""{frontmatter}
+
+## Compiled Truth
+
+{summary}
+
+## Timeline
+
+"""
+
+    timeline_entries = transcript[:10] if transcript else []
+    for entry in timeline_entries:
+        content += f"- {entry}\n"
+
+    content += "\n## Action Items\n\n"
+    if action_items:
+        for item in action_items:
+            content += f"- [ ] {item}\n"
+    else:
+        content += "- [ ] [Review transcript for action items]\n"
+
+    return content
+
+
+def import_meetings(meetings):
+    """Process and optionally save meetings."""
+    existing = []
+    new = []
+
+    for meeting in meetings:
+        if meeting_exists(meeting):
+            existing.append(meeting)
+        else:
+            new.append(meeting)
+
+    if DRY_RUN:
+        print(f"\n{'='*70}")
+        print(f"DRY RUN: Would import {len(new)} new meetings, skip {len(existing)} existing")
+        print(f"{'='*70}\n")
+    else:
+        print(f"\n{'='*70}")
+        print(f"Importing {len(new)} new meetings, skipping {len(existing)} existing")
+        print(f"{'='*70}\n")
+
+    for i, meeting in enumerate(new):
+        filename = f"{meeting['date']}-{slugify(meeting['title'])}.md"
+        formatted = format_meeting(meeting)
+
+        if i < 3:
+            print(f"\n[{i+1}/3] {filename}")
+            print(f"     {meeting['title']}")
+            print(f"     {len(meeting['attendees'])} attendees")
+            print(f"     Tags: {', '.join(generate_tags(meeting)) or 'none'}")
+            print(f"     Granola ID: {meeting['id']}")
+
+            if DRY_RUN:
+                print("\n" + "─"*70)
+                print(formatted)
+                print("─"*70)
+
+        if not DRY_RUN:
+            filepath = BRAIN_INBOX / filename
+            with open(filepath, 'w') as f:
+                f.write(formatted)
+            write_import_log(meeting['id'])
+            if i < 3:
+                print(f"     ✓ Saved")
+            elif i == 3:
+                print(f"\n... saving {len(new)-3} more meetings ...")
+
+    print(f"\n{'='*70}")
+    print(f"Summary:")
+    print(f"  • New meetings imported: {len(new)}")
+    print(f"  • Existing meetings skipped: {len(existing)}")
+    if len(new) > 3:
+        print(f"  • Preview shown for: 3 (first 3 of {len(new)})")
+    if FORCE:
+        print(f"  • Note: --force was used, duplicate checking skipped")
+    print(f"  • Import log: {IMPORT_LOG}")
+    print(f"{'='*70}\n")
+
+    if DRY_RUN:
+        print("Use 'granola-to-brain' without --dry-run to actually import files.\n")
+
+    return len(new), len(existing)
+
+
+def main():
+    print("Fetching Granola meetings from last 7 days...")
+    meetings = get_granola_meetings()
+    print(f"Found {len(meetings)} meetings\n")
+
+    if not meetings:
+        print("No meetings found.")
+        sys.exit(0)
+
+    BRAIN_INBOX.mkdir(parents=True, exist_ok=True)
+
+    imported, existing = import_meetings(meetings)
+
+
+if __name__ == "__main__":
+    main()
