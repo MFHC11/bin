@@ -673,7 +673,10 @@ phase_4_inbox_enrich() {
   inbox_after=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "*.md" -not -name "README.md" -type f 2>/dev/null | wc -l | tr -d ' ')
   local processed=$((inbox_before - inbox_after))
   echo "$processed" > "$RUN_DIR/phase-4.metric.processed"
-  log "   ${_C_GREEN}✓${_C_RESET} inbox files after: $inbox_after (delta moved-out: $processed)"
+  # Forward-only flow: delta counts files removed from inbox/ (emails deleted
+  # after enrichment, plus the rare meeting move). Non-email docs marked
+  # `enriched:` remain in inbox/ and don't count toward delta.
+  log "   ${_C_GREEN}✓${_C_RESET} inbox files after: $inbox_after (emails fully processed: $processed)"
 
   _phase_4_write_summary "$n" "$rc"
 

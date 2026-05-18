@@ -304,14 +304,36 @@ mkdir -p "$DIR"
 f=$(mktemp "$DIR/invocation-XXXXXX")
 for a in "$@"; do printf '%s\n' "$a" >> "$f"; done
 
-# If subagent mode (SUBAGENT_FILES: in any arg), mark each listed file enriched
-for a in "$@"; do
-  case "$a" in
-    *SUBAGENT_FILES:*)
-      files=$(printf '%s\n' "$a" | sed -n 's/.*SUBAGENT_FILES:[[:space:]]*//p')
-      for path in $files; do
-        if [ -f "$path" ] && [ "${MOCK_CLAUDE_SKIP_WATERMARK:-0}" != "1" ]; then
-          python3 - "$path" <<'PY'
+# Forward-only simulation: for each file we encounter, distinguish
+# email (frontmatter has thread_id:) from non-email and act accordingly.
+#   Email   → rm the file (matches the new delete-on-success default)
+#   Email + archive: true tag → mv to sources/email/YYYY-MM/
+#   Non-email → write `enriched: <date>` watermark (matches the docs flow)
+# AUTO_* tests seed without thread_id, so they continue watermarking and
+# their assertions remain valid. FORWARD_* tests seed with thread_id to
+# exercise the delete path.
+#
+# Two arrival modes:
+#   1) Parallel: the wrapper passes SUBAGENT_FILES: <paths…> in the prompt
+#      argument. We extract and process exactly those.
+#   2) Single-pass: no SUBAGENT_FILES; real agent would enumerate itself.
+#      The mock simulates the same enumeration to keep test coverage honest.
+
+process_one() {
+  path="$1"
+  [ -f "$path" ] || return 0
+  if grep -q '^thread_id:' "$path" 2>/dev/null; then
+    if grep -q '^archive: true' "$path" 2>/dev/null; then
+      base=$(basename "$path")
+      yyyymm=$(printf '%s' "$base" | sed -nE 's/^([0-9]{4})-([0-9]{2})-[0-9]{2}-.*/\1-\2/p')
+      archive_dir="${BRAIN_DIR:-$HOME/brain}/sources/email/$yyyymm"
+      mkdir -p "$archive_dir"
+      mv "$path" "$archive_dir/$base"
+    else
+      rm -f "$path"
+    fi
+  else
+    python3 - "$path" <<'PY'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 t = p.read_text()
@@ -319,11 +341,37 @@ parts = t.split('---', 2)
 if len(parts) >= 3:
     p.write_text(parts[0] + '---' + parts[1].rstrip() + '\nenriched: 2026-05-18\n---' + parts[2])
 PY
-        fi
-      done
+  fi
+}
+
+has_subagent_files=0
+for a in "$@"; do
+  case "$a" in
+    *SUBAGENT_FILES:*)
+      has_subagent_files=1
+      files=$(printf '%s\n' "$a" | sed -n 's/.*SUBAGENT_FILES:[[:space:]]*//p')
+      if [ "${MOCK_CLAUDE_SKIP_WATERMARK:-0}" != "1" ]; then
+        for path in $files; do process_one "$path"; done
+      fi
       ;;
   esac
 done
+
+# Single-pass mode: enumerate inbox/ ourselves the way the real agent would.
+if [ "$has_subagent_files" = "0" ] && [ "${MOCK_CLAUDE_SKIP_WATERMARK:-0}" != "1" ]; then
+  INBOX="${BRAIN_DIR:-$HOME/brain}/inbox"
+  if [ -d "$INBOX" ]; then
+    for f in "$INBOX"/*.md; do
+      [ -f "$f" ] || continue
+      base=$(basename "$f")
+      [ "$base" = "README.md" ] && continue
+      grep -q '^legacy-inbox:' "$f" 2>/dev/null && continue
+      grep -q '^enriched:' "$f" 2>/dev/null && continue
+      grep -q 'skip-enrich' "$f" 2>/dev/null && continue
+      process_one "$f"
+    done
+  fi
+fi
 
 cost="${MOCK_CLAUDE_COST:-0.42}"
 printf '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":%s,"result":"mock done"}\n' "$cost"
@@ -333,6 +381,60 @@ SH
   export CLAUDE_BIN="$mock"
   export MOCK_CLAUDE_INVOCATION_DIR="$TEST_TMP/claude-invocations"
   rm -rf "$MOCK_CLAUDE_INVOCATION_DIR"
+}
+
+# Seed N inbox files shaped like real emails: frontmatter includes thread_id.
+# The mock's forward-only path will DELETE these on success.
+seed_inbox_email_n() {
+  local n="$1" i dd ii
+  mkdir -p "$BRAIN_DIR/inbox"
+  for i in $(seq 1 $n); do
+    dd=$(printf '%02d' $((i % 28 + 1)))
+    ii=$(printf '%04d' $i)
+    cat > "$BRAIN_DIR/inbox/2026-04-$dd-email-real-$ii.md" <<MD
+---
+type: inbox
+tags: ["email"]
+date: 2026-04-$dd
+thread_id: mock-thread-$ii
+---
+# Mock email $i
+MD
+  done
+}
+
+# Seed one legacy file with the frozen-cohort marker.
+seed_inbox_legacy_one() {
+  local i="${1:-99}"
+  mkdir -p "$BRAIN_DIR/inbox"
+  cat > "$BRAIN_DIR/inbox/2026-04-01-email-legacy-$i.md" <<MD
+---
+type: inbox
+tags: ["email"]
+date: 2026-04-01
+thread_id: legacy-thread-$i
+enriched: 2026-04-15
+legacy-inbox: 2026-05-19
+---
+# Legacy email $i (frozen cohort)
+MD
+}
+
+# Seed one email with archive: true tag (archive-route exception).
+seed_inbox_archive_one() {
+  local i="${1:-1}" dd
+  dd=$(printf '%02d' $((i % 28 + 1)))
+  mkdir -p "$BRAIN_DIR/inbox"
+  cat > "$BRAIN_DIR/inbox/2026-04-$dd-email-archive-$i.md" <<MD
+---
+type: inbox
+tags: ["email"]
+date: 2026-04-$dd
+thread_id: archive-thread-$i
+archive: true
+---
+# Archive email $i (unique content path)
+MD
 }
 
 seed_inbox_n() {
@@ -473,9 +575,104 @@ SH
   assert_log_contains auto-retry "split-in-half retry" "T_INBOX_AUTO_6 — log records the retry"
 }
 
+# ─── Forward-only tests (T_INBOX_FORWARD_*) ─────────────────────────────────
+# These cover the 2026-05-19 forward-only flow: legacy-inbox skip,
+# email-delete-on-success, archive-route exception, prompt content rules.
+
+PROMPT_INBOX_REAL="$HOME/bin/prompts/inbox-enrich.md"
+SKILL_INBOX_REAL="$HOME/bin/skills/inbox-enrich/SKILL.md"
+
+# T_INBOX_FORWARD_1: enumeration skips files with legacy-inbox: marker.
+# Seed 3 fresh emails + 2 legacy. Expect single-pass (5 → 1 invocation
+# over the 3 fresh files, since 2 are skipped). After run, the 2 legacy
+# files remain untouched on disk.
+test_inbox_forward_legacy_skip() {
+  make_mock_claude_phase4_counting
+  make_stub_prompt_phase4
+  seed_inbox_email_n 3
+  seed_inbox_legacy_one 1
+  seed_inbox_legacy_one 2
+
+  ~/bin/brain-run --weekly --no-mail --no-granola --run-id=fwd-legacy </dev/null >/dev/null 2>&1
+
+  assert_state fwd-legacy 4 "succeeded" "T_INBOX_FORWARD_1 — phase 4 succeeded"
+  assert_equal "1" "$(count_invocations)" "T_INBOX_FORWARD_1 — single-pass (3 fresh; 2 legacy skipped)"
+  # Legacy files must survive untouched
+  assert_file_exists "$BRAIN_DIR/inbox/2026-04-01-email-legacy-1.md" "T_INBOX_FORWARD_1 — legacy file 1 untouched"
+  assert_file_exists "$BRAIN_DIR/inbox/2026-04-01-email-legacy-2.md" "T_INBOX_FORWARD_1 — legacy file 2 untouched"
+}
+
+# T_INBOX_FORWARD_2: emails get deleted from inbox/ after successful enrichment.
+# Seed 5 email-shaped files (thread_id present). The mock deletes them.
+# Phase-4 metric should report 5 fully processed.
+test_inbox_forward_email_delete() {
+  make_mock_claude_phase4_counting
+  make_stub_prompt_phase4
+  seed_inbox_email_n 5
+
+  ~/bin/brain-run --weekly --no-mail --no-granola --run-id=fwd-delete </dev/null >/dev/null 2>&1
+
+  assert_state fwd-delete 4 "succeeded" "T_INBOX_FORWARD_2 — phase 4 succeeded"
+  # All 5 should be gone from inbox/
+  local remaining
+  remaining=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "2026-04-*-email-real-*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+  assert_equal "0" "$remaining" "T_INBOX_FORWARD_2 — all 5 emails deleted from inbox/"
+  local metric
+  metric=$(<"$GBRAIN_HOME/runs/fwd-delete/phase-4.metric.processed")
+  assert_equal "5" "$metric" "T_INBOX_FORWARD_2 — metric reports 5 emails fully processed"
+}
+
+# T_INBOX_FORWARD_3: files with `archive: true` route to sources/email/YYYY-MM/.
+# Seed 1 archive-marked email; expect it to land in sources/email/2026-04/.
+test_inbox_forward_archive_route() {
+  make_mock_claude_phase4_counting
+  make_stub_prompt_phase4
+  seed_inbox_archive_one 1
+
+  ~/bin/brain-run --weekly --no-mail --no-granola --run-id=fwd-archive </dev/null >/dev/null 2>&1
+
+  assert_state fwd-archive 4 "succeeded" "T_INBOX_FORWARD_3 — phase 4 succeeded"
+  # File moved to sources/email/YYYY-MM/
+  local moved
+  moved=$(find "$BRAIN_DIR/sources/email" -name "2026-*-email-archive-1.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+  assert_equal "1" "$moved" "T_INBOX_FORWARD_3 — archive-tagged file moved to sources/email/"
+  # And gone from inbox/
+  local in_inbox
+  in_inbox=$(find "$BRAIN_DIR/inbox" -maxdepth 1 -name "2026-*-email-archive-1.md" -type f 2>/dev/null | wc -l | tr -d ' ')
+  assert_equal "0" "$in_inbox" "T_INBOX_FORWARD_3 — archive file removed from inbox/"
+}
+
+# T_INBOX_FORWARD_4: real prompt declares the gmail citation form and the
+# re-entry guard. Asserts against the live ~/bin/prompts/inbox-enrich.md
+# rather than the stub. This is the contract test for the prompt itself.
+test_inbox_forward_prompt_contract() {
+  assert_file_exists "$PROMPT_INBOX_REAL" "T_INBOX_FORWARD_4 — real prompt exists"
+  assert_file_contains "$PROMPT_INBOX_REAL" "gmail:<thread-id>" "T_INBOX_FORWARD_4 — prompt uses gmail:<thread-id> citation form"
+  assert_file_contains "$PROMPT_INBOX_REAL" "mail.google.com/mail/u/0" "T_INBOX_FORWARD_4 — prompt builds clickable Gmail URL"
+  assert_file_contains "$PROMPT_INBOX_REAL" "Re-entry guard" "T_INBOX_FORWARD_4 — prompt has Re-entry guard rule"
+  assert_file_contains "$PROMPT_INBOX_REAL" "legacy-inbox" "T_INBOX_FORWARD_4 — prompt enumerates legacy-inbox skip"
+  # No legacy citation form in the prompt's forward instructions
+  if grep -nE '\[Source: \[\[inbox/' "$PROMPT_INBOX_REAL" >/dev/null 2>&1; then
+    _fail "T_INBOX_FORWARD_4 — prompt still emits [Source: [[inbox/...]]] (legacy citation form)"
+  else
+    _pass "T_INBOX_FORWARD_4 — prompt does not emit legacy [[inbox/...]] citations"
+  fi
+}
+
+# T_INBOX_FORWARD_5: real prompt declares the mechanical dedup criteria
+# (email local-part vs email: frontmatter OR exact name in aliases: list).
+test_inbox_forward_dedup_contract() {
+  assert_file_exists "$PROMPT_INBOX_REAL" "T_INBOX_FORWARD_5 — real prompt exists"
+  assert_file_contains "$PROMPT_INBOX_REAL" "Mechanical alias dedup" "T_INBOX_FORWARD_5 — prompt names the dedup step"
+  assert_file_contains "$PROMPT_INBOX_REAL" "email local-part" "T_INBOX_FORWARD_5 — prompt criterion (a) names email-local-part match"
+  assert_file_contains "$PROMPT_INBOX_REAL" "aliases:" "T_INBOX_FORWARD_5 — prompt criterion (b) references aliases: list"
+  # New stubs include aliases: in frontmatter
+  assert_file_contains "$PROMPT_INBOX_REAL" "aliases: [\"<full display name>\"" "T_INBOX_FORWARD_5 — stub template includes aliases:"
+}
+
 # ─── Driver ──────────────────────────────────────────────────────────────────
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Phase 4 tests (inbox & enrich, mocked claude) — T25–T32 + AUTO_1–6"
+echo "  Phase 4 tests (inbox & enrich, mocked claude) — T25–T32 + AUTO_1–6 + FORWARD_1–5"
 echo "═══════════════════════════════════════════════════════════════"
 
 run_test "T25a: phase 4 runs under --weekly"               test_phase4_runs_under_weekly
@@ -495,5 +692,11 @@ run_test "T_INBOX_AUTO_3: 15 files → 2 subagents"          test_inbox_auto_15_
 run_test "T_INBOX_AUTO_4: 75 files → 8 subagents"          test_inbox_auto_75_files_eight_subagents
 run_test "T_INBOX_AUTO_5: 150 files → cost guard"          test_inbox_auto_150_files_cost_guard
 run_test "T_INBOX_AUTO_6: subagent fail → split retry"     test_inbox_auto_subagent_failure_retry
+
+run_test "T_INBOX_FORWARD_1: legacy-inbox skipped"         test_inbox_forward_legacy_skip
+run_test "T_INBOX_FORWARD_2: emails deleted on success"    test_inbox_forward_email_delete
+run_test "T_INBOX_FORWARD_3: archive: true routes file"    test_inbox_forward_archive_route
+run_test "T_INBOX_FORWARD_4: prompt has gmail citation"    test_inbox_forward_prompt_contract
+run_test "T_INBOX_FORWARD_5: prompt has dedup criteria"    test_inbox_forward_dedup_contract
 
 print_summary
