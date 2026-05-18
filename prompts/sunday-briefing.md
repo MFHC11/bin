@@ -37,7 +37,8 @@ The default calendar-first pipeline produces process bias. Run in this order:
    - `deals/fund-ii-lp-pre-marketing-pipeline.md`
 2. **For every Pledged or Qualified Opportunity LP**, check silence age: when was the last inbound, has it been answered? Anything 3+ days unanswered goes to Inbox Debt as priority.
 3. **tasks/active.md** — read Tier 1 section first
-4. **Last 7 days of inbox** — read all files with LP / HoldCo / KYC / DDQ / subscription / NAV in the filename or summary, regardless of recency rank
+3.5. **Gmail citations on LP / HoldCo pages (forward-compatible silence check)** — grep for `[Source: [gmail:` on every `companies/lp-*.md`, `companies/invicta-wealth-solutions.md`, and pages tagged `[lp,...]`. For each page, find the most recent gmail-citation date. If that date is 3+ days old AND no later `## Recent Activity` or `## Timeline` entry exists on the page (regardless of source), surface the LP in Inbox Debt with the citation thread-id. This is the post-2026-05-19 successor to the inbox-debt detector; the legacy inbox files in Step 4 cover the 308-file backlog.
+4. **Last 7 days of inbox** — read all files with LP / HoldCo / KYC / DDQ / subscription / NAV in the filename or summary, regardless of recency rank. After 2026-05-19 most new emails won't appear here (they get deleted post-enrichment); the legacy cohort (`legacy-inbox: 2026-05-19`) remains. Read both.
 5. **Calendar for next 7 days** — last, after commercial picture is built
 6. **Last 7 days of daily notes** — context only
 7. **Cross-reference attendees against people/companies pages**
@@ -76,12 +77,13 @@ Apply Tier 1-4 ranking. Each priority gets:
 ### ## Owed Responses (Inbox Debt)
 
 **Priority ordering rule:**
-1. Any email from a Pledged or Qualified Opportunity LP not responded to in 3+ days
+1. Any email from a Pledged or Qualified Opportunity LP not responded to in 3+ days. Detected via either: (a) the Step 3.5 LP-page gmail-citation scan (forward emails), or (b) the legacy inbox 7-day read (Step 4, pre-2026-05-19 cohort).
 2. Any DDQ or term sheet awaiting response
 3. Any subscription doc workflow awaiting action
 4. THEN general inbox debt, oldest first
 
 Format: `- [date] — [sender] — [topic] — [suggested action: reply / decline / delegate / schedule]`
+For forward emails surfaced from Step 3.5, sender is the LP name from the page heading; topic comes from the citation's `## Recent Activity` line.
 Max 10 items.
 
 ### ## Meeting Prep (Next 7 Days)
