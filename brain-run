@@ -27,7 +27,7 @@ typeset -g BRAIN_RUN_VERSION="0.9.1-phase4"
 
 # Models + tool grants (per spec §4.4)
 typeset -g MODEL_HAIKU="claude-haiku-4-5"
-typeset -g MODEL_SONNET="claude-sonnet-4-6"
+typeset -g MODEL_SONNET="${MODEL_SONNET:-claude-sonnet-4-6}"
 typeset -g MODEL_OPUS="claude-opus-4-7"
 typeset -g TOOLS_CALMAIL="mcp__claude_ai_Gmail__*,mcp__claude_ai_Google_Calendar__*,mcp__gbrain__*,Bash,Read,Write,Edit"
 typeset -g TOOLS_INBOX="mcp__plugin_claude-mem_mcp-search__*,mcp__gbrain__*,Bash,Read,Write,Edit"
@@ -46,6 +46,8 @@ typeset -g RUN_STARTED_EPOCH=0
 typeset -g MODE="weekly"
 typeset -g WITH_DREAM=0
 typeset -g YES_DREAM=0
+typeset -g WITH_CAL_INGEST=0
+typeset -g WITH_ATTIO=0
 typeset -g NO_MAIL=0
 typeset -g NO_ENRICH=0
 typeset -g NO_GRANOLA=0
@@ -115,6 +117,8 @@ MODES:
 FLAGS:
   --with-dream      Add Phase 6 (Opus synthesis). Requires approval.
   --yes-dream       Pre-approve Phase 6. Implies --with-dream.
+  --with-cal-ingest Run brain-calendar-sync.py before Phase 3 (weekly delta).
+  --with-attio      Run attio-ingest between Phase 2 and Phase 3 (weekly delta).
   --no-mail         Skip Phase 3.
   --no-enrich       Skip Phase 4.
   --no-granola      Skip Phase 2.
@@ -147,6 +151,8 @@ parse_args() {
       --weekly)       MODE="weekly" ;;
       --with-dream)   WITH_DREAM=1 ;;
       --yes-dream)    YES_DREAM=1; WITH_DREAM=1 ;;
+      --with-cal-ingest) WITH_CAL_INGEST=1 ;;
+      --with-attio)   WITH_ATTIO=1 ;;
       --no-mail)      NO_MAIL=1 ;;
       --no-enrich)    NO_ENRICH=1 ;;
       --no-granola)   NO_GRANOLA=1 ;;
@@ -493,6 +499,54 @@ phase_1_git_safety() {
   fi
 
   end_phase 1 succeeded
+}
+
+# ─── Phase 2·pre: Attio CRM ingest (opt-in stub) ─────────────────────────────
+# Weekly delta-sync of Attio CRM via attio-ingest. Skipped unless --with-attio
+# is passed. No manifest accounting — this is a stub for the recipe-defined
+# "weekly cron" cadence. Cost = $0 (zero LLM calls in default mode).
+# Runs BEFORE Phase 3/4 so its people/companies pages exist in time for the
+# inbox-enrich dedup grep.
+phase_2a_attio() {
+  if [ "$WITH_ATTIO" != "1" ]; then
+    return 0
+  fi
+  log ""
+  log "──────────────────────────────────────────────────────"
+  log " [2·pre/9] Attio CRM sync (attio-ingest)"
+  log "──────────────────────────────────────────────────────"
+  if [ ! -x "$HOME/bin/attio-ingest" ]; then
+    log "   ${_C_YELLOW}!${_C_RESET} attio-ingest not executable at \$HOME/bin/attio-ingest — skipping"
+    return 0
+  fi
+  local t0; t0=$(now_epoch)
+  if "$HOME/bin/attio-ingest" 2>&1 | tee -a "$RUN_LOG"; then
+    local t1; t1=$(now_epoch)
+    log "   ${_C_GREEN}✓${_C_RESET} attio delta synced in $((t1 - t0))s"
+  else
+    log "   ${_C_YELLOW}!${_C_RESET} attio sync had errors — continuing (non-fatal)"
+  fi
+}
+
+# ─── Phase 3·pre: Calendar ingest (opt-in stub) ──────────────────────────────
+# Weekly delta-sync of Google Calendar via brain-calendar-sync.py. Skipped
+# unless --with-cal-ingest is passed. No manifest accounting — this is a stub
+# for the recipe-defined "weekly cron" cadence (recipe Step 7). Cost = $0.
+phase_3a_cal_ingest() {
+  if [ "$WITH_CAL_INGEST" != "1" ]; then
+    return 0
+  fi
+  log ""
+  log "──────────────────────────────────────────────────────"
+  log " [3·pre/9] Calendar ingest (brain-calendar-sync.py)"
+  log "──────────────────────────────────────────────────────"
+  local t0; t0=$(now_epoch)
+  if "$HOME/bin/brain-calendar-sync.py" 2>&1 | tee -a "$RUN_LOG"; then
+    local t1; t1=$(now_epoch)
+    log "   ${_C_GREEN}✓${_C_RESET} calendar delta synced in $((t1 - t0))s"
+  else
+    log "   ${_C_YELLOW}!${_C_RESET} calendar sync had errors — continuing (non-fatal)"
+  fi
 }
 
 # ─── Phase 3: Cal-mail sync (Sonnet) ─────────────────────────────────────────
@@ -1287,6 +1341,8 @@ main() {
   phase_0_preflight
   phase_1_git_safety
   phase_2_granola
+  phase_2a_attio
+  phase_3a_cal_ingest
   phase_3_calmail
   phase_4_inbox_enrich
   phase_5_gbrain_dream
