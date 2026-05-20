@@ -1,0 +1,2407 @@
+#!/usr/bin/env python3
+"""attio-ingest — pull Attio CRM data into ~/brain/{people,companies}/.
+
+Marcus-only by default: ingests records where marcus@erv.io appears as
+owner_member_id on last_email_interaction or last_calendar_interaction,
+plus all records on the three qualifying named lists confirmed
+2026-05-19: 'Top co fundraise', 'LP Fundraising', 'The Drop'.
+
+Three passes:
+  1. People + Companies — find-or-create entity pages, dedup by email
+     local-part / domain, populate frontmatter, append a stub or net-new
+     facts to ## Recent Activity.
+  2. Notes — fetch all notes for every qualifying record (regardless
+     of which team member authored them); dedup by attio-note:<id>
+     citation already on the page; append to ## Timeline.
+  3. Interaction metadata — project last_*_interaction.{interacted_at,
+     owner_actor} into frontmatter (attio_first_contact, attio_last_contact,
+     attio_interaction_count, attio_last_owner).
+
+Delta sync: ~/bin/.last-attio-sync (ISO timestamp). On subsequent runs,
+filter records by updated_at >= watermark; if Attio rejects that filter
+slug, fall back to last_*_interaction.interacted_at >= watermark.
+Watermark advances only after all writes succeed.
+
+Auth: ATTIO_API_KEY in macOS keychain.
+  security add-generic-password -a "$USER" -s ATTIO_API_KEY -w '<key>'
+Scopes required (verified via /v2/self): record_permission:read,
+object_configuration:read, note:read, list_configuration:read,
+list_entry:read, user_management:read.
+
+No LLM calls in default mode. --enrich-notes is reserved for a future
+Haiku entity extraction pass (not implemented yet).
+
+This script does not call brain-sync. brain-run --with-attio invokes
+it as Phase 2.5 between Granola and Cal-mail.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections import defaultdict
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+BRAIN = Path.home() / "brain"
+PEOPLE_DIR = BRAIN / "people"
+COMPANIES_DIR = BRAIN / "companies"
+TASKS_DIR = BRAIN / ".tasks"
+
+BIN_DIR = Path.home() / "bin"
+WATERMARK_PATH = BIN_DIR / ".last-attio-sync"
+MARCUS_MID_CACHE = BIN_DIR / ".attio-marcus-mid"
+LOCK_PATH = BIN_DIR / ".attio-ingest.lock"
+
+LOG_DIR = Path.home() / "logs"
+LOG_PATH = LOG_DIR / "attio-ingest.log"
+
+ATTIO_BASE = "https://api.attio.com/v2"
+HTTP_TIMEOUT_S = 30
+MAX_RETRIES = 5
+PAGE_SIZE_RECORDS = 500
+PAGE_SIZE_NOTES = 50
+HARD_PAGE_CAP = 200  # safety: refuse to page past this many requests for one query
+
+# Qualifying lists — confirmed by Marcus 2026-05-19.
+QUALIFYING_LISTS: list[tuple[str, str, str]] = [
+    ("Top co fundraise", "d6ee3e9b-ddf2-42e8-b5dc-d2f503ab27a9", "companies"),
+    ("LP Fundraising", "67acad84-0921-43ef-a9d3-7c8cbdbaae1c", "companies"),
+    ("The Drop", "06458823-c9bc-41ae-977d-7ea29c148299", "people"),
+]
+
+# Inherited from inbox-enrich.md.
+SKIP_EMAIL_DOMAINS_FOR_COMPANY_STUB = {
+    "gmail.com", "outlook.com", "icloud.com", "yahoo.com", "hotmail.com",
+    "me.com", "live.com", "proton.me", "protonmail.com",
+}
+SKIP_EMAIL_LOCALS = {
+    "marketing", "info", "hello", "noreply", "no-reply", "donotreply",
+    "support", "accounts", "billing", "team", "contact", "admin",
+}
+# Don't auto-stub team members. Existing pages may still be updated.
+INTERNAL_TEAM_DOMAINS_FOR_STUB = {"erv.io"}
+
+# Injection-defense. No INJECTION_PATTERNS shared lib exists in ~/bin/;
+# defined here as the single source.
+INJECTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"!\[[^\]]*\]\([^)]*\)"), ""),  # markdown image tags
+    (re.compile(r"<script\b[^>]*>.*?</script>", re.I | re.DOTALL), ""),
+    (re.compile(r"<iframe\b[^>]*>.*?</iframe>", re.I | re.DOTALL), ""),
+    (re.compile(r"<[a-zA-Z][^>]*on[a-z]+\s*=", re.I), "<"),  # inline event handlers
+    (re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]"), ""),  # control chars except \n \t \r
+]
+# ISO-3166-1 alpha-2 → display name. Curated to ERV's geography; unknown codes
+# fall through to the raw code so the brain still gets *something* useful.
+ISO_COUNTRY_NAMES: dict[str, str] = {
+    "GB": "United Kingdom", "US": "United States", "FR": "France",
+    "DE": "Germany", "IT": "Italy", "ES": "Spain", "NL": "Netherlands",
+    "CH": "Switzerland", "BE": "Belgium", "IE": "Ireland", "DK": "Denmark",
+    "SE": "Sweden", "NO": "Norway", "FI": "Finland", "AT": "Austria",
+    "PL": "Poland", "CZ": "Czech Republic", "PT": "Portugal", "GR": "Greece",
+    "LU": "Luxembourg", "EE": "Estonia", "LV": "Latvia", "LT": "Lithuania",
+    "IS": "Iceland", "MT": "Malta", "CY": "Cyprus", "HU": "Hungary",
+    "RO": "Romania", "BG": "Bulgaria", "HR": "Croatia", "SK": "Slovakia",
+    "SI": "Slovenia",
+    "CA": "Canada", "AU": "Australia", "NZ": "New Zealand",
+    "JP": "Japan", "KR": "South Korea", "CN": "China", "IN": "India",
+    "SG": "Singapore", "HK": "Hong Kong", "TW": "Taiwan", "MY": "Malaysia",
+    "ID": "Indonesia", "TH": "Thailand", "PH": "Philippines", "VN": "Vietnam",
+    "AE": "United Arab Emirates", "IL": "Israel", "SA": "Saudi Arabia",
+    "TR": "Turkey", "EG": "Egypt", "ZA": "South Africa", "NG": "Nigeria",
+    "KE": "Kenya", "MA": "Morocco",
+    "BR": "Brazil", "MX": "Mexico", "AR": "Argentina", "CL": "Chile",
+    "CO": "Colombia", "PE": "Peru",
+    "RU": "Russia", "UA": "Ukraine",
+}
+
+
+def country_from_iso(code: str | None) -> str:
+    """ISO-3166-1 alpha-2 → display name; fallback to raw code if unknown."""
+    if not code:
+        return ""
+    code_up = code.strip().upper()
+    return ISO_COUNTRY_NAMES.get(code_up, code_up)
+
+
+# Strip ALL markdown links — js:, data:, http(s):, and anything else.
+# URL portion allows one level of nested parens, then scrub_content iterates
+# for any deeper nesting. Handles `[t](javascript:alert(1))`. Wikilinks
+# `[[Foo]]` aren't matched (no `(` after `]]`).
+MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((?:[^()]*\([^()]*\))*[^()]*\)")
+
+# ─── Errors ───────────────────────────────────────────────────────────────────
+
+
+class AttioError(Exception):
+    """Base for all Attio-related failures. Always raised, never silently swallowed."""
+
+
+class AttioAuthMissingError(AttioError):
+    pass
+
+
+class AttioAuthError(AttioError):
+    pass
+
+
+class AttioScopeError(AttioError):
+    pass
+
+
+class AttioRateLimitError(AttioError):
+    pass
+
+
+class AttioFetchError(AttioError):
+    pass
+
+
+class AttioFilterError(AttioError):
+    pass
+
+
+class AttioWriteError(AttioError):
+    pass
+
+
+class MarcusNotFoundError(AttioError):
+    pass
+
+
+class LockHeldError(AttioError):
+    pass
+
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+
+def _log_jsonl(event: str, **kwargs: Any) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": now_iso(), "event": event, **kwargs}
+    try:
+        with LOG_PATH.open("a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except OSError:
+        pass  # never let logging tank the run
+
+
+def info(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def today_iso() -> str:
+    return dt.date.today().isoformat()
+
+
+# ─── SSL ──────────────────────────────────────────────────────────────────────
+
+
+def _make_ssl_context() -> ssl.SSLContext:
+    """Find a usable CA bundle. Python.org Python 3.x on macOS does not trust
+    the system keychain by default — without this the script gets
+    CERTIFICATE_VERIFY_FAILED. Try (in order): SSL_CERT_FILE env var,
+    Python's built-in bundle if Install Certificates.command was run,
+    then the macOS LibreSSL bundle at /etc/ssl/cert.pem."""
+    candidates: list[str | None] = [
+        os.environ.get("SSL_CERT_FILE"),
+        os.environ.get("REQUESTS_CA_BUNDLE"),
+    ]
+    # Python.org installer writes here when Install Certificates.command runs.
+    py_etc = Path(sys.prefix) / "etc" / "openssl" / "cert.pem"
+    if py_etc.is_file():
+        candidates.append(str(py_etc))
+    if Path("/etc/ssl/cert.pem").is_file():
+        candidates.append("/etc/ssl/cert.pem")
+    for c in candidates:
+        if c and Path(c).is_file():
+            return ssl.create_default_context(cafile=c)
+    # Fall through to default — will raise loudly with a clear error if it can't verify.
+    return ssl.create_default_context()
+
+
+_SSL_CTX = _make_ssl_context()
+
+
+# ─── Keychain ─────────────────────────────────────────────────────────────────
+
+
+def load_api_key() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not user:
+        raise AttioAuthMissingError("$USER not set; cannot look up keychain item")
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-a", user, "-s", "ATTIO_API_KEY", "-w"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise AttioAuthMissingError("keychain lookup timed out")
+    if r.returncode != 0:
+        msg = (r.stderr or "").strip() or "ATTIO_API_KEY not in keychain"
+        raise AttioAuthMissingError(
+            f"{msg}\n"
+            "add it with:\n"
+            "  security add-generic-password -a \"$USER\" -s ATTIO_API_KEY -w '<your-key>'"
+        )
+    key = r.stdout.strip()
+    if not key:
+        raise AttioAuthMissingError("ATTIO_API_KEY is empty in keychain")
+    return key
+
+
+# ─── HTTP ─────────────────────────────────────────────────────────────────────
+
+
+def attio_request(
+    method: str,
+    path: str,
+    key: str,
+    body: dict | None = None,
+    params: dict | None = None,
+) -> tuple[int, Any]:
+    """Make one Attio API call. Handles 429 with Retry-After, exp-backoff 5xx.
+    Raises typed errors for auth/scope/rate-limit/server failures. Never
+    swallows errors silently."""
+    url = ATTIO_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    raw_body = json.dumps(body).encode() if body is not None else None
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+    if raw_body is not None:
+        headers["Content-Type"] = "application/json"
+
+    backoff = 1.0
+    last_err: str = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        t0 = time.monotonic()
+        req = urllib.request.Request(url, data=raw_body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S, context=_SSL_CTX) as resp:
+                status = resp.status
+                payload = resp.read()
+                dur_ms = int((time.monotonic() - t0) * 1000)
+                _log_jsonl(
+                    "http", method=method, path=path, status=status,
+                    duration_ms=dur_ms, attempt=attempt,
+                )
+                if not payload:
+                    return status, {}
+                try:
+                    return status, json.loads(payload)
+                except json.JSONDecodeError as e:
+                    raise AttioFetchError(
+                        f"200 OK but unparseable JSON from {path}: {e}"
+                    )
+        except urllib.error.HTTPError as e:
+            status = e.code
+            try:
+                err_body = json.loads(e.read().decode()[:8192])
+                err_msg = err_body.get("message") or str(err_body)[:400]
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError, OSError):
+                err_msg = "<unparseable body>"
+            dur_ms = int((time.monotonic() - t0) * 1000)
+            _log_jsonl(
+                "http", method=method, path=path, status=status,
+                duration_ms=dur_ms, attempt=attempt, error=err_msg,
+            )
+            if status == 401:
+                raise AttioAuthError(f"401 unauthorised: {err_msg}")
+            if status == 403:
+                raise AttioScopeError(f"403 missing scope: {err_msg}")
+            if status == 400 and ("filter" in err_msg.lower() or "attribute" in err_msg.lower()):
+                raise AttioFilterError(f"400 filter rejected: {err_msg}")
+            if status == 429:
+                retry_after = e.headers.get("Retry-After")
+                try:
+                    sleep_s = float(retry_after) if retry_after else backoff
+                except ValueError:
+                    sleep_s = backoff
+                if attempt >= MAX_RETRIES:
+                    raise AttioRateLimitError(f"429 after {MAX_RETRIES} retries: {err_msg}")
+                info(f"  429 → sleeping {sleep_s:.1f}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(min(sleep_s, 60))
+                continue
+            if 500 <= status < 600:
+                if attempt >= MAX_RETRIES:
+                    raise AttioFetchError(f"{status} after {MAX_RETRIES} retries: {err_msg}")
+                info(f"  {status} → backoff {backoff:.1f}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            # Any other 4xx is a permanent client error — surface immediately.
+            raise AttioFetchError(f"{status}: {err_msg}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = repr(e)
+            _log_jsonl(
+                "http", method=method, path=path, status=0,
+                attempt=attempt, error=last_err,
+            )
+            if attempt >= MAX_RETRIES:
+                raise AttioFetchError(f"network failure after {MAX_RETRIES} attempts: {last_err}")
+            info(f"  network err → backoff {backoff:.1f}s (attempt {attempt}/{MAX_RETRIES}): {last_err}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+    raise AttioFetchError(f"exhausted retries: {last_err}")
+
+
+def attio_paged_records(
+    object_slug: str,
+    key: str,
+    filter_body: dict,
+    page_size: int = PAGE_SIZE_RECORDS,
+) -> Iterator[dict]:
+    """Iterate every record matching the filter, paging via offset.
+    Caps at HARD_PAGE_CAP * page_size records as a safety net."""
+    offset = 0
+    pages = 0
+    while True:
+        if pages >= HARD_PAGE_CAP:
+            raise AttioFetchError(
+                f"hit hard page cap of {HARD_PAGE_CAP} pages on /objects/{object_slug}/records/query"
+            )
+        body = {**filter_body, "limit": page_size, "offset": offset}
+        status, data = attio_request(
+            "POST", f"/objects/{object_slug}/records/query", key, body=body,
+        )
+        records = data.get("data", []) if isinstance(data, dict) else []
+        for rec in records:
+            yield rec
+        if len(records) < page_size:
+            return
+        offset += page_size
+        pages += 1
+
+
+def attio_paged_notes(
+    key: str,
+    parent_object: str,
+    parent_record_id: str,
+    page_size: int = PAGE_SIZE_NOTES,
+) -> Iterator[dict]:
+    offset = 0
+    pages = 0
+    while True:
+        if pages >= HARD_PAGE_CAP:
+            raise AttioFetchError(f"hit hard page cap on /notes for {parent_object}/{parent_record_id}")
+        params = {
+            "parent_object": parent_object,
+            "parent_record_id": parent_record_id,
+            "limit": page_size,
+            "offset": offset,
+        }
+        status, data = attio_request("GET", "/notes", key, params=params)
+        notes = data.get("data", []) if isinstance(data, dict) else []
+        for n in notes:
+            yield n
+        if len(notes) < page_size:
+            return
+        offset += page_size
+        pages += 1
+
+
+def attio_paged_list_entries(key: str, list_id: str) -> Iterator[dict]:
+    offset = 0
+    pages = 0
+    while True:
+        if pages >= HARD_PAGE_CAP:
+            raise AttioFetchError(f"hit hard page cap on /lists/{list_id}/entries/query")
+        body = {"limit": PAGE_SIZE_RECORDS, "offset": offset}
+        status, data = attio_request(
+            "POST", f"/lists/{list_id}/entries/query", key, body=body,
+        )
+        entries = data.get("data", []) if isinstance(data, dict) else []
+        for e in entries:
+            yield e
+        if len(entries) < PAGE_SIZE_RECORDS:
+            return
+        offset += PAGE_SIZE_RECORDS
+        pages += 1
+
+
+# ─── Bootstrap ────────────────────────────────────────────────────────────────
+
+
+def resolve_workspace(key: str) -> tuple[str, dict[str, str]]:
+    """Returns (MARCUS_MID, {mid: 'First Last'}). Single /workspace_members
+    call serves both Marcus identification and note-author display name
+    mapping. Falls back to /v2/self if user_management:read is missing —
+    in that case the name map is empty (notes will cite by mid)."""
+    try:
+        status, data = attio_request("GET", "/workspace_members", key)
+        members = data.get("data", [])
+        name_map: dict[str, str] = {}
+        marcus_mid: str | None = None
+        for m in members:
+            mid = (m.get("id") or {}).get("workspace_member_id")
+            if not _is_uuid(mid):
+                continue
+            fn = (m.get("first_name") or "").strip()
+            ln = (m.get("last_name") or "").strip()
+            name_map[mid] = (fn + " " + ln).strip() or (m.get("email_address") or mid)
+            if (m.get("email_address") or "").lower() == "marcus@erv.io":
+                marcus_mid = mid
+        if marcus_mid:
+            BIN_DIR.mkdir(parents=True, exist_ok=True)
+            MARCUS_MID_CACHE.write_text(marcus_mid + "\n")
+            return marcus_mid, name_map
+        raise MarcusNotFoundError(
+            "marcus@erv.io not in workspace_members; check Attio workspace membership"
+        )
+    except AttioScopeError:
+        info("  user_management:read missing → /v2/self fallback (note authors cited by mid)")
+        status, data = attio_request("GET", "/self", key)
+        mid = data.get("authorized_by_workspace_member_id")
+        if not _is_uuid(mid):
+            raise MarcusNotFoundError(
+                "could not resolve MARCUS_MID from /self either"
+            )
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        MARCUS_MID_CACHE.write_text(mid + "\n")
+        return mid, {}
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _is_uuid(s: Any) -> bool:
+    return isinstance(s, str) and bool(_UUID_RE.match(s))
+
+
+# ─── Filter construction ──────────────────────────────────────────────────────
+
+
+def build_interaction_filter(mid: str, since_iso: str | None) -> list[dict]:
+    """Return one filter body per interaction-attribute slug we care about.
+    Caller queries each separately and unions results by record_id."""
+    slugs = ["last_email_interaction", "last_calendar_interaction"]
+    bodies: list[dict] = []
+    for slug in slugs:
+        sub: dict[str, Any] = {"owner_member_id": mid}
+        if since_iso:
+            sub["interacted_at"] = {"$gte": since_iso}
+        bodies.append({"filter": {slug: sub}})
+    return bodies
+
+
+def build_updated_at_filter(mid: str, since_iso: str) -> dict:
+    """Try the spec'd top-level updated_at filter. May be rejected by Attio's
+    filter validator — caller catches AttioFilterError and falls back."""
+    return {
+        "filter": {
+            "$or": [
+                {"last_email_interaction": {"owner_member_id": mid}},
+                {"last_calendar_interaction": {"owner_member_id": mid}},
+            ],
+            "updated_at": {"$gte": since_iso},
+        }
+    }
+
+
+def fetch_qualifying_records(
+    key: str,
+    object_slug: str,
+    mid: str,
+    since_iso: str | None,
+    full_org: bool = False,
+    limit: int = 0,
+) -> dict[str, dict]:
+    """Returns {record_id: record_dict}. Unions:
+    (interaction_filter ∪ list_qualified) when not full_org, else everything.
+
+    On delta runs, tries updated_at + interaction first; if Attio rejects,
+    drops back to interaction-only filter.
+
+    `limit > 0` stops fetching once that many distinct records are in `out`.
+    Used for --dry-run/--stats sampling."""
+    out: dict[str, dict] = {}
+
+    def hit_limit() -> bool:
+        return limit > 0 and len(out) >= limit
+
+    if full_org:
+        info(f"  --full-org: pulling ALL {object_slug} records")
+        all_body: dict = {}
+        if since_iso:
+            try:
+                all_body = {"filter": {"updated_at": {"$gte": since_iso}}}
+                for rec in attio_paged_records(object_slug, key, all_body):
+                    rid = _record_id(rec)
+                    if rid:
+                        out[rid] = rec
+                        if hit_limit(): return out
+                return out
+            except AttioFilterError:
+                info("  updated_at filter rejected; falling back to full pull (delta lost)")
+        for rec in attio_paged_records(object_slug, key, {}):
+            rid = _record_id(rec)
+            if rid:
+                out[rid] = rec
+                if hit_limit(): return out
+        return out
+
+    # Marcus-only path. Try the union filter with updated_at first.
+    used_updated_at = False
+    if since_iso:
+        try:
+            for rec in attio_paged_records(
+                object_slug, key, build_updated_at_filter(mid, since_iso)
+            ):
+                rid = _record_id(rec)
+                if rid:
+                    out[rid] = rec
+                    if hit_limit(): return out
+            used_updated_at = True
+            info(f"  {object_slug}: delta filter using updated_at + interaction; {len(out)} records so far")
+        except AttioFilterError as e:
+            info(f"  updated_at filter rejected ({e}); falling back to interaction-only delta")
+
+    if not used_updated_at:
+        for body in build_interaction_filter(mid, since_iso):
+            if hit_limit(): return out
+            for rec in attio_paged_records(object_slug, key, body):
+                rid = _record_id(rec)
+                if rid:
+                    out[rid] = rec
+                    if hit_limit(): return out
+
+    # List qualification — independent set, unioned in.
+    for list_name, list_id, parent in QUALIFYING_LISTS:
+        if parent != object_slug:
+            continue
+        if hit_limit():
+            return out
+        try:
+            ids = set()
+            for entry in attio_paged_list_entries(key, list_id):
+                rid = entry.get("parent_record_id")
+                if rid:
+                    ids.add(rid)
+            info(f"  {object_slug}: list {list_name!r} contributes {len(ids)} record_id(s)")
+            # Fetch any list-qualified records not already in out.
+            missing = ids - out.keys()
+            for rid in missing:
+                if hit_limit():
+                    return out
+                try:
+                    status, data = attio_request(
+                        "GET", f"/objects/{object_slug}/records/{rid}", key,
+                    )
+                    if isinstance(data, dict) and data.get("data"):
+                        out[rid] = data["data"]
+                except AttioFetchError as e:
+                    info(f"    skip list record {rid[:8]}: {e}")
+        except AttioScopeError:
+            info(f"  list {list_name!r}: no read access (workspace_access=None); skipping")
+        except AttioFetchError as e:
+            info(f"  list {list_name!r}: fetch failed: {e}")
+
+    return out
+
+
+def _record_id(rec: dict) -> str | None:
+    rid = (rec.get("id") or {}).get("record_id")
+    return rid if _is_uuid(rid) else None
+
+
+# ─── Attio value extraction ───────────────────────────────────────────────────
+#
+# Attio returns each attribute as an ARRAY of timestamped value objects.
+# We want the currently-active value (active_until is null).
+
+
+def _active_values(rec: dict, slug: str) -> list[dict]:
+    arr = (rec.get("values") or {}).get(slug) or []
+    return [v for v in arr if v.get("active_until") in (None, "")]
+
+
+_QUOTES_AND_SPACE = re.compile(r"\s+")
+
+
+def _clean_name(s: str) -> str:
+    """Strip surrounding ASCII / smart quotes, collapse runs of whitespace.
+    Attio stores some names with literal embedded quotes (e.g. `'Mats  Blacker'`)
+    and stray double spaces — surfaces that as ugly markdown."""
+    if not s:
+        return ""
+    s = s.strip()
+    while len(s) >= 2 and s[0] in "\"'‘’“”" and s[-1] in "\"'‘’“”":
+        s = s[1:-1].strip()
+    return _QUOTES_AND_SPACE.sub(" ", s).strip()
+
+
+def extract_person_name(rec: dict) -> str:
+    for v in _active_values(rec, "name"):
+        full = _clean_name(v.get("full_name") or "")
+        if full:
+            return full
+        first = _clean_name(v.get("first_name") or "")
+        last = _clean_name(v.get("last_name") or "")
+        if first or last:
+            return (first + " " + last).strip()
+    return ""
+
+
+def extract_person_emails(rec: dict) -> list[str]:
+    out: list[str] = []
+    for v in _active_values(rec, "email_addresses"):
+        em = (v.get("email_address") or "").strip()
+        if em:
+            out.append(em)
+    return out
+
+
+def extract_person_job_title(rec: dict) -> str:
+    for v in _active_values(rec, "job_title"):
+        t = (v.get("value") or "").strip()
+        if t:
+            return t
+    return ""
+
+
+def extract_person_linked_company_id(rec: dict) -> str | None:
+    for v in _active_values(rec, "company"):
+        if v.get("target_object") == "companies":
+            tid = v.get("target_record_id")
+            if _is_uuid(tid):
+                return tid
+    return None
+
+
+def extract_company_name(rec: dict) -> str:
+    for v in _active_values(rec, "name"):
+        n = _clean_name(v.get("value") or v.get("name") or "")
+        if n:
+            return n
+    return ""
+
+
+def extract_company_domains(rec: dict) -> list[str]:
+    out: list[str] = []
+    for v in _active_values(rec, "domains"):
+        d = (v.get("domain") or "").strip().lower()
+        if d:
+            out.append(d)
+    return out
+
+
+def extract_company_description(rec: dict) -> str:
+    for v in _active_values(rec, "description"):
+        d = (v.get("value") or "").strip()
+        if d:
+            return d
+    return ""
+
+
+def extract_primary_location(rec: dict) -> dict[str, str]:
+    """Pull the current value of primary_location and normalise to a flat dict.
+    Returns {} if no location data. Keys: locality, region, country_code,
+    country_name (resolved from ISO-2). All values are str (never None)."""
+    for v in _active_values(rec, "primary_location"):
+        if v.get("attribute_type") != "location":
+            continue
+        locality = (v.get("locality") or "").strip()
+        region = (v.get("region") or "").strip()
+        country_code = (v.get("country_code") or "").strip()
+        if not (locality or region or country_code):
+            continue
+        return {
+            "locality": locality,
+            "region": region,
+            "country_code": country_code,
+            "country_name": country_from_iso(country_code),
+        }
+    return {}
+
+
+def format_location_display(loc: dict[str, str]) -> str:
+    """Build a 1–2-piece display string from a location dict.
+    Examples: 'London, United Kingdom' | 'Somerville' | 'United Kingdom'."""
+    if not loc:
+        return ""
+    city = loc.get("locality") or ""
+    country = loc.get("country_name") or loc.get("country_code") or ""
+    region = loc.get("region") or ""
+    if city and country:
+        return f"{city}, {country}"
+    if city and region:
+        return f"{city}, {region}"
+    if city:
+        return city
+    if region and country:
+        return f"{region}, {country}"
+    if country:
+        return country
+    return region
+
+
+def apply_person_location_frontmatter(fm: dict, loc: dict[str, str]) -> dict:
+    """Mutate fm in-place with location fields. Only writes keys where Attio
+    has data; absent values do not overwrite existing user-set values.
+    timezone is intentionally not written — Attio does not surface it."""
+    if not loc:
+        return fm
+    display = format_location_display(loc)
+    if display:
+        fm["location"] = display
+    if loc.get("locality"):
+        fm["city"] = loc["locality"]
+    country = loc.get("country_name") or loc.get("country_code")
+    if country:
+        fm["country"] = country
+    return fm
+
+
+def apply_company_location_frontmatter(fm: dict, loc: dict[str, str]) -> dict:
+    if not loc:
+        return fm
+    if loc.get("locality"):
+        fm["hq_city"] = loc["locality"]
+    country = loc.get("country_name") or loc.get("country_code")
+    if country:
+        fm["hq_country"] = country
+    return fm
+
+
+# ─── Generic value extractors for the enrichment attrs ──────────────────────
+# Attio attribute_type → JSON shape:
+#   text       v["value"] (str)
+#   number     v["value"] (int|float)
+#   date       v["value"] ("YYYY-MM-DD")
+#   select     v["option"]["title"]  (single = first value; multi = each value)
+#   phone-number v["phone_number"] (E.164)
+#   currency   v["currency_value"] (or v["value"] as a fallback — unverified)
+
+
+def _text_value(rec: dict, slug: str) -> str:
+    for v in _active_values(rec, slug):
+        s = (v.get("value") or "").strip() if isinstance(v.get("value"), str) else ""
+        if s:
+            return s
+    return ""
+
+
+def _number_value(rec: dict, slug: str) -> int | float | None:
+    for v in _active_values(rec, slug):
+        n = v.get("value")
+        if isinstance(n, (int, float)):
+            return n
+    return None
+
+
+def _date_value(rec: dict, slug: str) -> str:
+    for v in _active_values(rec, slug):
+        d = v.get("value")
+        if isinstance(d, str) and d:
+            return d
+    return ""
+
+
+def _select_value(rec: dict, slug: str) -> str:
+    """Return the first option's title."""
+    for v in _active_values(rec, slug):
+        opt = v.get("option") or {}
+        title = opt.get("title")
+        if isinstance(title, str) and title:
+            return title
+    return ""
+
+
+def _select_multi_values(rec: dict, slug: str) -> list[str]:
+    """Return every option's title, preserving Attio's order."""
+    out: list[str] = []
+    for v in _active_values(rec, slug):
+        opt = v.get("option") or {}
+        title = opt.get("title")
+        if isinstance(title, str) and title and title not in out:
+            out.append(title)
+    return out
+
+
+def _phone_value(rec: dict, slug: str = "phone_numbers") -> str:
+    for v in _active_values(rec, slug):
+        n = (v.get("phone_number") or "").strip()
+        if n:
+            return n
+    return ""
+
+
+def _currency_value(rec: dict, slug: str) -> int | float | None:
+    """Defensive: docs imply v["currency_value"] + v["currency_code"], but no
+    populated record was found in the workspace at investigation time. Try
+    `currency_value` first, fall back to `value`."""
+    for v in _active_values(rec, slug):
+        for key in ("currency_value", "value"):
+            n = v.get(key)
+            if isinstance(n, (int, float)):
+                return n
+    return None
+
+
+def extract_person_enrichment(rec: dict) -> dict[str, Any]:
+    """Pull every supplementary frontmatter field for a person record.
+    Returns only the keys for which Attio has data. Caller passes this
+    dict into apply_person_enrichment_frontmatter."""
+    out: dict[str, Any] = {}
+    li = _text_value(rec, "linkedin")
+    if li:
+        out["linkedin"] = li
+    tw = _text_value(rec, "twitter")
+    if tw:
+        out["twitter"] = tw
+    tw_n = _number_value(rec, "twitter_follower_count")
+    if isinstance(tw_n, (int, float)):
+        out["twitter_followers"] = int(tw_n)
+    ph = _phone_value(rec)
+    if ph:
+        out["phone"] = ph
+    desc = _text_value(rec, "description")
+    if desc:
+        out["description"] = scrub_content(desc)[:500]
+    return out
+
+
+def extract_company_enrichment(rec: dict, domains: list[str]) -> dict[str, Any]:
+    """Pull every supplementary frontmatter field for a company record.
+    `domains` is already extracted by extract_company_domains; we use the
+    first to synthesize the `website:` field since Attio has no website attr."""
+    out: dict[str, Any] = {}
+
+    if domains:
+        out["website"] = f"https://{domains[0]}"
+
+    desc = _text_value(rec, "description")
+    if desc:
+        out["description"] = scrub_content(desc)[:500]
+
+    li = _text_value(rec, "linkedin")
+    if li:
+        out["linkedin"] = li
+    tw = _text_value(rec, "twitter")
+    if tw:
+        out["twitter"] = tw
+    tw_n = _number_value(rec, "twitter_follower_count")
+    if isinstance(tw_n, (int, float)):
+        out["twitter_followers"] = int(tw_n)
+
+    er = _select_value(rec, "employee_range")
+    if er:
+        out["employee_range"] = er
+
+    fdate = _date_value(rec, "foundation_date")
+    if fdate and len(fdate) >= 4:
+        # YYYY-MM-DD → year only. Validate the 4-char prefix is digits.
+        year = fdate[:4]
+        if year.isdigit():
+            out["founded_year"] = int(year)
+
+    cats = _select_multi_values(rec, "categories")
+    if cats:
+        # Attio's category enrichment is multi-select and often noisy. We
+        # surface the raw list and skip a single-pick `industry:` — Marcus
+        # reads the categories himself.
+        out["categories"] = cats
+
+    arr = _select_value(rec, "estimated_arr_usd")
+    if arr:
+        out["arr_band"] = arr
+
+    funding = _currency_value(rec, "funding_raised_usd")
+    if isinstance(funding, (int, float)):
+        out["total_funding_usd"] = funding
+
+    return out
+
+
+def apply_person_enrichment_frontmatter(fm: dict, enrich: dict[str, Any]) -> dict:
+    """Merge enrichment into fm. Attio is source-of-truth for these scalar
+    metadata fields: overwrite freely. Empty/missing keys do nothing."""
+    for k, v in enrich.items():
+        if v != "" and v is not None:
+            fm[k] = v
+    return fm
+
+
+def apply_company_enrichment_frontmatter(fm: dict, enrich: dict[str, Any]) -> dict:
+    for k, v in enrich.items():
+        if v != "" and v is not None:
+            fm[k] = v
+    return fm
+
+
+def extract_interaction(rec: dict, slug: str) -> dict | None:
+    """Return {at, owner_mid} for the current value of an interaction attr,
+    or None if absent."""
+    for v in _active_values(rec, slug):
+        at = v.get("interacted_at")
+        owner = (v.get("owner_actor") or {}).get("id")
+        if at:
+            return {"at": at, "owner_mid": owner}
+    return None
+
+
+# ─── Slug + dedup ─────────────────────────────────────────────────────────────
+
+
+_SLUG_STRIP = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(name: str) -> str:
+    """Lowercase, ASCII-fold-ish, hyphenated. Matches inbox-enrich convention."""
+    if not name:
+        return ""
+    # Fold a few common diacritics.
+    folded = (name.lower()
+              .replace("ø", "o").replace("æ", "ae").replace("ß", "ss"))
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", folded)
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    slug = _SLUG_STRIP.sub("-", folded).strip("-")
+    return slug
+
+
+def _local_part(email: str) -> str:
+    return email.split("@", 1)[0].strip().lower() if "@" in email else ""
+
+
+def _domain_part(email: str) -> str:
+    return email.split("@", 1)[1].strip().lower() if "@" in email else ""
+
+
+# ─── Frontmatter parse / write ────────────────────────────────────────────────
+#
+# Minimal YAML-ish parser. Brain pages use simple key: value, no nested dicts.
+# `aliases:` is a YAML flow array on one line, `tags:` likewise. Anything else
+# is a scalar string. This keeps us off PyYAML which would be a new dep.
+
+
+_FM_DELIM = "---"
+
+
+def read_page(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.is_file():
+        return {}, ""
+    text = path.read_text()
+    if not text.startswith("---\n"):
+        return {}, text
+    lines = text.splitlines(keepends=True)
+    end_idx = None
+    for i, ln in enumerate(lines[1:], start=1):
+        if ln.rstrip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return {}, text
+    fm_raw = "".join(lines[1:end_idx])
+    body = "".join(lines[end_idx + 1:])
+    return _parse_frontmatter(fm_raw), body
+
+
+def _parse_frontmatter(raw: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for line in raw.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if v.startswith("[") and v.endswith("]"):
+            inner = v[1:-1].strip()
+            if not inner:
+                out[k] = []
+            else:
+                out[k] = [_unquote(s.strip()) for s in _split_csv(inner)]
+        else:
+            out[k] = _unquote(v) if v else ""
+    return out
+
+
+def _split_csv(s: str) -> list[str]:
+    """Split on commas not inside quotes."""
+    out: list[str] = []
+    buf: list[str] = []
+    in_quote: str | None = None
+    for ch in s:
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+            buf.append(ch)
+        elif ch in ("'", '"'):
+            in_quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _quote_for_yaml(s: str) -> str:
+    """Wrap in double quotes if the value would confuse our parser or YAML
+    semantics. Leading '-' is the sequence-item gotcha; leading whitespace
+    breaks key parsing on re-read."""
+    if not s:
+        return '""'
+    if s[0] in "-?:[{!&*|>'\"" or s != s.lstrip():
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if any(ch in s for ch in [":", ",", "[", "]", "#", "{", "}", "&", "*", "!", "|", ">", "\"", "'"]):
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
+def render_frontmatter(fm: dict[str, Any]) -> str:
+    """Render in the order: type, title, created, tags, date, email, aliases,
+    location keys, then attio_* fields, then anything else (sorted).
+    Matches existing brain page conventions."""
+    preferred = [
+        # identity
+        "type", "title", "created", "tags", "date", "email", "aliases",
+        # geography
+        "location", "city", "country", "timezone",
+        "hq_city", "hq_country",
+        # social / contact
+        "linkedin", "twitter", "twitter_followers", "phone",
+        # company facts
+        "website", "employee_range", "founded_year",
+        "categories",
+        "arr_band", "total_funding_usd",
+        # longer text last so it doesn't visually wedge between scalars
+        "description",
+    ]
+    attio_keys = sorted(k for k in fm if k.startswith("attio_"))
+    other_keys = sorted(k for k in fm if k not in preferred and k not in attio_keys)
+    ordered = [k for k in preferred if k in fm] + attio_keys + other_keys
+
+    out: list[str] = ["---"]
+    for k in ordered:
+        v = fm[k]
+        if isinstance(v, list):
+            quoted = ", ".join(_quote_for_yaml(str(x)) for x in v)
+            out.append(f"{k}: [{quoted}]")
+        elif v == "" or v is None:
+            out.append(f"{k}: ")
+        else:
+            out.append(f"{k}: {_quote_for_yaml(str(v))}")
+    out.append("---")
+    return "\n".join(out) + "\n"
+
+
+def write_page_atomic(path: Path, fm: dict[str, Any], body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp.open("w") as f:
+            f.write(render_frontmatter(fm))
+            if not body.startswith("\n"):
+                f.write("\n")
+            f.write(body)
+            if not body.endswith("\n"):
+                f.write("\n")
+        tmp.replace(path)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise AttioWriteError(f"write to {path}: {e}")
+
+
+# ─── Existing-page lookup (mechanical dedup) ──────────────────────────────────
+
+
+@dataclasses.dataclass
+class PeopleIndex:
+    by_slug: dict[str, Path] = dataclasses.field(default_factory=dict)
+    by_email_local: dict[str, Path] = dataclasses.field(default_factory=dict)
+    by_alias_lower: dict[str, Path] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class CompaniesIndex:
+    by_slug: dict[str, Path] = dataclasses.field(default_factory=dict)
+    by_domain: dict[str, Path] = dataclasses.field(default_factory=dict)
+    by_alias_lower: dict[str, Path] = dataclasses.field(default_factory=dict)
+
+
+def build_people_index() -> PeopleIndex:
+    """Read every people/*.md page once and build O(1) lookup tables.
+    Built at run start to avoid O(N×M) disk scans inside the per-record loop."""
+    idx = PeopleIndex()
+    if not PEOPLE_DIR.is_dir():
+        return idx
+    for path in PEOPLE_DIR.glob("*.md"):
+        idx.by_slug[path.stem] = path
+        try:
+            fm, _ = read_page(path)
+        except OSError:
+            continue
+        email = (fm.get("email") or "").strip().lower()
+        if email and "@" in email:
+            lp = _local_part(email)
+            if lp:
+                idx.by_email_local.setdefault(lp, path)
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, list):
+            for a in aliases:
+                if isinstance(a, str) and a:
+                    idx.by_alias_lower.setdefault(a.lower(), path)
+    return idx
+
+
+def build_companies_index() -> CompaniesIndex:
+    idx = CompaniesIndex()
+    if not COMPANIES_DIR.is_dir():
+        return idx
+    for path in COMPANIES_DIR.glob("*.md"):
+        idx.by_slug[path.stem] = path
+        try:
+            fm, body = read_page(path)
+        except OSError:
+            continue
+        aliases = fm.get("aliases") or []
+        if isinstance(aliases, list):
+            for a in aliases:
+                if not isinstance(a, str) or not a:
+                    continue
+                lo = a.lower()
+                idx.by_alias_lower.setdefault(lo, path)
+                # Aliases often contain domains (mirrored from stub creation).
+                if "." in lo and " " not in lo:
+                    idx.by_domain.setdefault(lo, path)
+    return idx
+
+
+def find_existing_person(idx: PeopleIndex, name: str, emails: list[str]) -> Path | None:
+    """Mechanical dedup per inbox-enrich rule:
+       1. exact slug match
+       2. email-local-part matches frontmatter `email:`
+       3. exact display name in frontmatter `aliases:`
+    """
+    if name:
+        path = idx.by_slug.get(slugify(name))
+        if path:
+            return path
+    for em in emails:
+        lp = _local_part(em)
+        if lp:
+            path = idx.by_email_local.get(lp)
+            if path:
+                return path
+    if name:
+        path = idx.by_alias_lower.get(name.lower())
+        if path:
+            return path
+    return None
+
+
+def find_existing_company(idx: CompaniesIndex, name: str, domains: list[str]) -> Path | None:
+    if name:
+        ns = slugify(name)
+        path = idx.by_slug.get(ns) or idx.by_slug.get(f"lp-{ns}")
+        if path:
+            return path
+    for d in domains:
+        path = idx.by_domain.get(d.lower())
+        if path:
+            return path
+    if name:
+        path = idx.by_alias_lower.get(name.lower())
+        if path:
+            return path
+    return None
+
+
+def register_new_path(
+    people_idx: PeopleIndex | None,
+    companies_idx: CompaniesIndex | None,
+    path: Path,
+    name: str,
+    emails: list[str] | None = None,
+    domains: list[str] | None = None,
+) -> None:
+    """Update the in-memory index when a new stub is created mid-run so a
+    second Attio record for the same entity in the same run dedups."""
+    if people_idx is not None:
+        people_idx.by_slug[path.stem] = path
+        if name:
+            people_idx.by_alias_lower.setdefault(name.lower(), path)
+        for em in emails or []:
+            lp = _local_part(em)
+            if lp:
+                people_idx.by_email_local.setdefault(lp, path)
+    if companies_idx is not None:
+        companies_idx.by_slug[path.stem] = path
+        if name:
+            companies_idx.by_alias_lower.setdefault(name.lower(), path)
+        for d in domains or []:
+            companies_idx.by_domain.setdefault(d.lower(), path)
+
+
+# ─── Page rendering ───────────────────────────────────────────────────────────
+
+
+def stub_person_page(rec: dict, name: str, emails: list[str], job_title: str) -> tuple[dict, str]:
+    primary_email = emails[0] if emails else ""
+    aliases = list({name, _local_part(primary_email)} - {""})
+    fm = {
+        "type": "person",
+        "title": name,
+        "created": today_iso(),
+        "tags": ["stub", "attio-sourced"],
+        "date": today_iso(),
+        "email": primary_email,
+        "aliases": aliases,
+    }
+    body_lines = [
+        f"# {name}",
+        "",
+        f"> Stub created from Attio CRM on {today_iso()}.",
+        "> Context: person record qualifies under Marcus interaction filter or named-list membership.",
+        "",
+        "## Emails",
+        "",
+    ]
+    for em in emails:
+        body_lines.append(f"- {em}")
+    body_lines += ["", "## Affiliation", "", ""]
+    if job_title:
+        body_lines.append(f"- {job_title}")
+    body_lines += ["", "## Recent Activity", "", "", "## Timeline", ""]
+    return fm, "\n".join(body_lines) + "\n"
+
+
+def stub_company_page(name: str, domains: list[str], description: str) -> tuple[dict, str]:
+    aliases = [name] + [d for d in domains]
+    fm = {
+        "type": "company",
+        "title": name,
+        "created": today_iso(),
+        "tags": ["stub", "attio-sourced"],
+        "date": today_iso(),
+        "aliases": aliases,
+    }
+    body_lines = [
+        f"# {name}",
+        "",
+        f"> Stub created from Attio CRM on {today_iso()}.",
+        "> Context: company record qualifies under Marcus interaction filter or named-list membership.",
+        "",
+    ]
+    if description:
+        body_lines += [scrub_content(description)[:500], ""]
+    if domains:
+        body_lines += ["## Domains", ""]
+        for d in domains:
+            body_lines.append(f"- {d}")
+        body_lines.append("")
+    body_lines += ["## Recent Activity", "", "", "## Timeline", ""]
+    return fm, "\n".join(body_lines) + "\n"
+
+
+def merge_interaction_frontmatter(
+    fm: dict, rec: dict, author_names: dict[str, str] | None = None,
+) -> dict:
+    """Project Attio's interaction attributes into attio_* frontmatter fields.
+    These are metadata, not content — safe to overwrite on every run.
+    `author_names` maps workspace_member_id → display name; when present,
+    attio_last_owner reads as e.g. "Peter Robson" instead of a UUID. Falls
+    back to the raw MID if the mapping is missing or empty."""
+    out = dict(fm)
+    first_email = extract_interaction(rec, "first_email_interaction")
+    first_cal = extract_interaction(rec, "first_calendar_interaction")
+    last_email = extract_interaction(rec, "last_email_interaction")
+    last_cal = extract_interaction(rec, "last_calendar_interaction")
+
+    candidates_first = [x["at"] for x in (first_email, first_cal) if x]
+    candidates_last = [x["at"] for x in (last_email, last_cal) if x]
+    if candidates_first:
+        out["attio_first_contact"] = min(candidates_first)
+    if candidates_last:
+        out["attio_last_contact"] = max(candidates_last)
+        winner = max(
+            [x for x in (last_email, last_cal) if x],
+            key=lambda x: x["at"],
+        )
+        owner_mid = winner.get("owner_mid")
+        if owner_mid:
+            out["attio_last_owner"] = (author_names or {}).get(owner_mid, owner_mid)
+
+    # Interaction count isn't a top-level attribute — we approximate by
+    # counting historical values on the interaction arrays. Attio surfaces
+    # active + inactive entries; len() of the array is an upper bound.
+    n = 0
+    for slug in ("last_email_interaction", "last_calendar_interaction"):
+        arr = (rec.get("values") or {}).get(slug) or []
+        n += len(arr)
+    if n:
+        out["attio_interaction_count"] = n
+
+    return out
+
+
+def merge_aliases(existing: Any, new: list[str]) -> list[str]:
+    base = list(existing) if isinstance(existing, list) else []
+    base_lower = {str(x).lower() for x in base}
+    for item in new:
+        if item and item.lower() not in base_lower:
+            base.append(item)
+            base_lower.add(item.lower())
+    return base
+
+
+def append_to_section(body: str, section: str, line: str) -> str:
+    """Append a single line to the named ## section. Creates the section
+    immediately before ## Timeline if it doesn't exist, else at EOF."""
+    pat = re.compile(rf"^##\s+{re.escape(section)}\s*$", re.M)
+    m = pat.search(body)
+    if m:
+        # Find end of this section = next ## heading, or EOF.
+        next_m = re.search(r"^##\s+", body[m.end():], re.M)
+        if next_m:
+            insert_at = m.end() + next_m.start()
+            # Trim trailing whitespace before next section, then insert.
+            chunk = body[m.end():insert_at]
+            cleaned = chunk.rstrip() + "\n" + line + "\n\n"
+            return body[:m.end()] + cleaned + body[insert_at:]
+        else:
+            trimmed = body.rstrip("\n")
+            return trimmed + "\n" + line + "\n"
+    # Section absent — create it before Timeline if present.
+    tm = re.search(r"^##\s+Timeline\s*$", body, re.M)
+    new_section = f"\n## {section}\n\n{line}\n"
+    if tm:
+        return body[:tm.start()] + new_section + "\n" + body[tm.start():]
+    return body.rstrip("\n") + new_section
+
+
+def note_already_cited(body: str, note_id: str) -> bool:
+    return f"attio-note:{note_id}" in body
+
+
+def format_note_timeline_line(note: dict, author_names: dict[str, str] | None = None) -> str:
+    note_id = (note.get("id") or {}).get("note_id") or ""
+    created = (note.get("created_at") or "")[:10]
+    title = (note.get("title") or "").strip()
+    author_id = (note.get("created_by_actor") or {}).get("id") or ""
+    author = (author_names or {}).get(author_id) or author_id or "unknown"
+    content = note.get("content_plaintext") or note.get("content_markdown") or ""
+    content = scrub_content(content)
+    snippet = " ".join(content.split())[:200]
+    if title:
+        summary = f"{title} — {snippet}" if snippet else title
+    else:
+        summary = snippet or "(empty note)"
+    return f"- {created}: {summary} [Source: attio-note:{note_id} {created} ({author})]"
+
+
+def scrub_content(s: str) -> str:
+    """Defence-in-depth: strip image tags, scripts, control chars, then strip
+    every markdown link regardless of scheme. Link stripping iterates so
+    nested parens (e.g. `[t](javascript:f(1))`) are fully consumed."""
+    if not s:
+        return ""
+    for pat, repl in INJECTION_PATTERNS:
+        s = pat.sub(repl, s)
+    while True:
+        new = MD_LINK_PATTERN.sub(r"\1", s)
+        if new == s:
+            break
+        s = new
+    return s
+
+
+# ─── Watermark ────────────────────────────────────────────────────────────────
+
+
+def read_watermark() -> str | None:
+    if not WATERMARK_PATH.is_file():
+        return None
+    txt = WATERMARK_PATH.read_text().strip()
+    return txt or None
+
+
+def write_watermark_atomic(ts: str) -> None:
+    WATERMARK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WATERMARK_PATH.with_suffix(WATERMARK_PATH.suffix + ".tmp")
+    tmp.write_text(ts + "\n")
+    tmp.replace(WATERMARK_PATH)
+
+
+@contextmanager
+def watermark_guard():
+    """Backup watermark before the run; restore on exception. Mirrors
+    brain-run's with_watermark_guard."""
+    backup: Path | None = None
+    if WATERMARK_PATH.is_file():
+        backup = WATERMARK_PATH.with_suffix(WATERMARK_PATH.suffix + ".bak")
+        backup.write_bytes(WATERMARK_PATH.read_bytes())
+    try:
+        yield
+    except BaseException:
+        if backup and backup.is_file():
+            backup.replace(WATERMARK_PATH)
+            info("  watermark restored to pre-run value (failure)")
+        elif WATERMARK_PATH.is_file():
+            WATERMARK_PATH.unlink()
+            info("  stray watermark removed (failure, no prior value)")
+        raise
+    else:
+        if backup and backup.is_file():
+            try:
+                backup.unlink()
+            except OSError:
+                pass
+
+
+# ─── Lock ─────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def acquire_lock():
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        try:
+            stale = LOCK_PATH.read_text().strip()
+        except OSError:
+            stale = "<unreadable>"
+        raise LockHeldError(
+            f"another attio-ingest is running (lock {LOCK_PATH} held by pid {stale}). "
+            "If you're sure no other run is in flight, rm the file."
+        )
+    try:
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.close(fd)
+        yield
+    finally:
+        try:
+            LOCK_PATH.unlink()
+        except FileNotFoundError:
+            pass
+
+
+# ─── Run summary ──────────────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass
+class RunStats:
+    people_pages_created: int = 0
+    people_pages_updated: int = 0
+    companies_pages_created: int = 0
+    companies_pages_updated: int = 0
+    notes_appended: int = 0
+    notes_skipped_dup: int = 0
+    interaction_metadata_updated: int = 0
+    records_skipped_no_name: int = 0
+    records_skipped_internal: int = 0
+    api_calls: int = 0  # informational; logging captures the real number
+    started_at: str = dataclasses.field(default_factory=now_iso)
+
+    def as_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+def write_run_summary(stats: RunStats, mode: str, since_iso: str | None) -> Path:
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y-%m-%d-%H%M")
+    path = TASKS_DIR / f"attio-run-{stamp}.md"
+    lines = [
+        f"# Attio ingest — {stamp}",
+        "",
+        f"- Mode: {mode}",
+        f"- Since: {since_iso or '(full pull, no watermark)'}",
+        f"- Started: {stats.started_at}",
+        f"- Ended:   {now_iso()}",
+        "",
+        "## Counts",
+        "",
+        f"- People pages created:    {stats.people_pages_created}",
+        f"- People pages updated:    {stats.people_pages_updated}",
+        f"- Companies pages created: {stats.companies_pages_created}",
+        f"- Companies pages updated: {stats.companies_pages_updated}",
+        f"- Notes appended:          {stats.notes_appended}",
+        f"- Notes skipped (dup):     {stats.notes_skipped_dup}",
+        f"- Interaction frontmatter: {stats.interaction_metadata_updated}",
+        f"- Skipped (no name):       {stats.records_skipped_no_name}",
+        f"- Skipped (internal team): {stats.records_skipped_internal}",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+# ─── Pass orchestration ───────────────────────────────────────────────────────
+
+
+def run_pass_people(
+    people: dict[str, dict],
+    idx: PeopleIndex,
+    stats: RunStats,
+    dry_run: bool,
+    author_names: dict[str, str] | None = None,
+) -> dict[str, Path]:
+    """Returns {record_id: path_to_brain_page}."""
+    record_to_path: dict[str, Path] = {}
+    for rid, rec in people.items():
+        name = extract_person_name(rec)
+        emails = extract_person_emails(rec)
+        job_title = extract_person_job_title(rec)
+        loc = extract_primary_location(rec)
+        enrich = extract_person_enrichment(rec)
+
+        if not name and not emails:
+            stats.records_skipped_no_name += 1
+            continue
+        primary_domain = _domain_part(emails[0]) if emails else ""
+        is_internal = primary_domain in INTERNAL_TEAM_DOMAINS_FOR_STUB
+
+        existing = find_existing_person(idx, name, emails)
+        if existing:
+            fm, body = read_page(existing)
+            fm = merge_interaction_frontmatter(fm, rec, author_names)
+            fm = apply_person_location_frontmatter(fm, loc)
+            fm = apply_person_enrichment_frontmatter(fm, enrich)
+            new_aliases: list[str] = []
+            if name:
+                new_aliases.append(name)
+            for em in emails:
+                lp = _local_part(em)
+                if lp:
+                    new_aliases.append(lp)
+            fm["aliases"] = merge_aliases(fm.get("aliases"), new_aliases)
+            if emails and not fm.get("email"):
+                fm["email"] = emails[0]
+            if not dry_run:
+                write_page_atomic(existing, fm, body)
+            stats.people_pages_updated += 1
+            stats.interaction_metadata_updated += 1
+            record_to_path[rid] = existing
+            continue
+
+        if is_internal:
+            stats.records_skipped_internal += 1
+            continue
+        if not name:
+            stats.records_skipped_no_name += 1
+            continue
+
+        slug = slugify(name) or f"attio-{rid[:8]}"
+        path = PEOPLE_DIR / f"{slug}.md"
+        if path.is_file():
+            for n in range(2, 100):
+                cand = PEOPLE_DIR / f"{slug}-{n}.md"
+                if not cand.is_file():
+                    path = cand
+                    break
+        fm, body = stub_person_page(rec, name, emails, job_title)
+        fm = merge_interaction_frontmatter(fm, rec, author_names)
+        fm = apply_person_location_frontmatter(fm, loc)
+        fm = apply_person_enrichment_frontmatter(fm, enrich)
+        if not dry_run:
+            write_page_atomic(path, fm, body)
+        register_new_path(idx, None, path, name, emails=emails)
+        stats.people_pages_created += 1
+        stats.interaction_metadata_updated += 1
+        record_to_path[rid] = path
+    return record_to_path
+
+
+def run_pass_companies(
+    companies: dict[str, dict],
+    idx: CompaniesIndex,
+    stats: RunStats,
+    dry_run: bool,
+    author_names: dict[str, str] | None = None,
+) -> dict[str, Path]:
+    record_to_path: dict[str, Path] = {}
+    for rid, rec in companies.items():
+        name = extract_company_name(rec)
+        domains = extract_company_domains(rec)
+        description = extract_company_description(rec)
+        loc = extract_primary_location(rec)
+        enrich = extract_company_enrichment(rec, domains)
+        if not name:
+            stats.records_skipped_no_name += 1
+            continue
+
+        existing = find_existing_company(idx, name, domains)
+        if existing:
+            fm, body = read_page(existing)
+            fm = merge_interaction_frontmatter(fm, rec, author_names)
+            fm = apply_company_location_frontmatter(fm, loc)
+            fm = apply_company_enrichment_frontmatter(fm, enrich)
+            new_aliases = [name] + list(domains)
+            fm["aliases"] = merge_aliases(fm.get("aliases"), new_aliases)
+            if not dry_run:
+                write_page_atomic(existing, fm, body)
+            stats.companies_pages_updated += 1
+            stats.interaction_metadata_updated += 1
+            record_to_path[rid] = existing
+            continue
+
+        slug = slugify(name) or f"attio-{rid[:8]}"
+        path = COMPANIES_DIR / f"{slug}.md"
+        if path.is_file():
+            for n in range(2, 100):
+                cand = COMPANIES_DIR / f"{slug}-{n}.md"
+                if not cand.is_file():
+                    path = cand
+                    break
+        fm, body = stub_company_page(name, domains, description)
+        fm = merge_interaction_frontmatter(fm, rec, author_names)
+        fm = apply_company_location_frontmatter(fm, loc)
+        fm = apply_company_enrichment_frontmatter(fm, enrich)
+        if not dry_run:
+            write_page_atomic(path, fm, body)
+        register_new_path(None, idx, path, name, domains=domains)
+        stats.companies_pages_created += 1
+        stats.interaction_metadata_updated += 1
+        record_to_path[rid] = path
+    return record_to_path
+
+
+def run_pass_notes(
+    key: str,
+    record_paths: dict[str, Path],
+    parent_object: str,
+    author_names: dict[str, str],
+    stats: RunStats,
+    dry_run: bool,
+) -> None:
+    for rid, path in record_paths.items():
+        try:
+            notes = list(attio_paged_notes(key, parent_object, rid))
+        except AttioFetchError as e:
+            info(f"  notes fetch failed for {parent_object}/{rid[:8]}: {e}")
+            continue
+        if not notes:
+            continue
+        fm, body = read_page(path)
+        appended = False
+        for note in notes:
+            note_id = (note.get("id") or {}).get("note_id") or ""
+            if not note_id:
+                continue
+            if note_already_cited(body, note_id):
+                stats.notes_skipped_dup += 1
+                continue
+            line = format_note_timeline_line(note, author_names)
+            body = append_to_section(body, "Timeline", line)
+            stats.notes_appended += 1
+            appended = True
+        if appended and not dry_run:
+            write_page_atomic(path, fm, body)
+
+
+# ─── Commands ─────────────────────────────────────────────────────────────────
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    key = load_api_key()
+    mid, _author_names = resolve_workspace(key)
+    info(f"MARCUS_MID = {mid}")
+
+    since_iso = read_watermark() if not args.full else None
+    info(f"since = {since_iso or '(full pull)'}")
+    info("")
+
+    info("counting people…")
+    people = fetch_qualifying_records(key, "people", mid, since_iso, full_org=args.full_org, limit=args.limit)
+    info(f"  qualifying people: {len(people)}")
+
+    info("counting companies…")
+    companies = fetch_qualifying_records(key, "companies", mid, since_iso, full_org=args.full_org, limit=args.limit)
+    info(f"  qualifying companies: {len(companies)}")
+
+    if people:
+        sample = next(iter(people.values()))
+        info("")
+        info("sample person:")
+        info(f"  name:    {extract_person_name(sample)}")
+        info(f"  emails:  {extract_person_emails(sample)}")
+        info(f"  title:   {extract_person_job_title(sample)}")
+    if companies:
+        sample = next(iter(companies.values()))
+        info("")
+        info("sample company:")
+        info(f"  name:    {extract_company_name(sample)}")
+        info(f"  domains: {extract_company_domains(sample)}")
+
+    return 0
+
+
+def _fetch_and_locate(
+    key: str,
+    object_slug: str,
+    mid: str,
+    since_iso: str | None,
+    full_org: bool,
+    idx: PeopleIndex | CompaniesIndex,
+    limit: int = 0,
+) -> tuple[dict[str, dict], dict[str, Path]]:
+    """Fetch qualifying records and locate paths for those that already
+    have brain pages. Used by --pass notes / --pass interactions where we
+    don't want to create stubs but still need to know where to write."""
+    records = fetch_qualifying_records(key, object_slug, mid, since_iso, full_org=full_org, limit=limit)
+    paths: dict[str, Path] = {}
+    for rid, rec in records.items():
+        if object_slug == "people":
+            name = extract_person_name(rec)
+            emails = extract_person_emails(rec)
+            p = find_existing_person(idx, name, emails) if isinstance(idx, PeopleIndex) else None
+        else:
+            name = extract_company_name(rec)
+            domains = extract_company_domains(rec)
+            p = find_existing_company(idx, name, domains) if isinstance(idx, CompaniesIndex) else None
+        if p:
+            paths[rid] = p
+    return records, paths
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Full / delta sync. Honours --dry-run."""
+    key = load_api_key()
+    mid, author_names = resolve_workspace(key)
+    info(f"MARCUS_MID = {mid}  (workspace_members map: {len(author_names)})")
+    since_iso = read_watermark() if not args.full else None
+    info(f"since = {since_iso or '(full pull)'}  mode = {'dry-run' if args.dry_run else 'LIVE'}")
+
+    if not args.dry_run and not since_iso and not args.full and not args.yes_first_run:
+        info("")
+        info("first-ever run detected (no watermark). Live writes require --yes-first-run.")
+        info("Run --stats first, then --dry-run, then --full --yes-first-run when ready.")
+        return 4
+
+    started_at = now_iso()
+    stats = RunStats(started_at=started_at)
+    summary_path: Path | None = None
+
+    # Build indexes once. O(N) disk read replaces O(N×M) scan inside the
+    # per-record loop. Done before the lock guard so that an indexing error
+    # surfaces clearly without holding the lock.
+    info("building people/companies indexes…")
+    people_idx = build_people_index()
+    companies_idx = build_companies_index()
+    info(f"  people: {len(people_idx.by_slug)} pages | "
+         f"companies: {len(companies_idx.by_slug)} pages")
+
+    with acquire_lock(), watermark_guard():
+        people: dict[str, dict] = {}
+        companies: dict[str, dict] = {}
+        people_paths: dict[str, Path] = {}
+        company_paths: dict[str, Path] = {}
+
+        run_entities = args.pass_name in (None, "people")
+        run_notes = args.pass_name in (None, "notes")
+        run_interactions_only = args.pass_name == "interactions"
+
+        if run_entities:
+            info("")
+            info("─── Pass 1a: People ───")
+            people = fetch_qualifying_records(
+                key, "people", mid, since_iso, full_org=args.full_org, limit=args.limit,
+            )
+            info(f"  fetched {len(people)} people")
+            people_paths = run_pass_people(people, people_idx, stats, args.dry_run, author_names)
+
+            info("─── Pass 1b: Companies ───")
+            companies = fetch_qualifying_records(
+                key, "companies", mid, since_iso, full_org=args.full_org, limit=args.limit,
+            )
+            info(f"  fetched {len(companies)} companies")
+            company_paths = run_pass_companies(companies, companies_idx, stats, args.dry_run, author_names)
+
+        if run_notes:
+            info("─── Pass 2: Notes ───")
+            if not run_entities:
+                # Notes-only run: fetch records to know which paths to target,
+                # but don't create stubs. Look up paths in the existing index.
+                people, people_paths = _fetch_and_locate(
+                    key, "people", mid, since_iso, args.full_org, people_idx, limit=args.limit,
+                )
+                companies, company_paths = _fetch_and_locate(
+                    key, "companies", mid, since_iso, args.full_org, companies_idx, limit=args.limit,
+                )
+                info(f"  located {len(people_paths)}/{len(people)} people pages, "
+                     f"{len(company_paths)}/{len(companies)} company pages")
+            run_pass_notes(key, people_paths, "people", author_names, stats, args.dry_run)
+            run_pass_notes(key, company_paths, "companies", author_names, stats, args.dry_run)
+
+        if run_interactions_only:
+            info("─── Pass 3 only: refresh interaction frontmatter ───")
+            people, _ = _fetch_and_locate(
+                key, "people", mid, since_iso, args.full_org, people_idx, limit=args.limit,
+            )
+            companies, _ = _fetch_and_locate(
+                key, "companies", mid, since_iso, args.full_org, companies_idx, limit=args.limit,
+            )
+            for rid, rec in people.items():
+                name = extract_person_name(rec)
+                emails = extract_person_emails(rec)
+                p = find_existing_person(people_idx, name, emails)
+                if not p:
+                    continue
+                fm, body = read_page(p)
+                fm = merge_interaction_frontmatter(fm, rec, author_names)
+                fm = apply_person_location_frontmatter(fm, extract_primary_location(rec))
+                fm = apply_person_enrichment_frontmatter(fm, extract_person_enrichment(rec))
+                if not args.dry_run:
+                    write_page_atomic(p, fm, body)
+                stats.interaction_metadata_updated += 1
+            for rid, rec in companies.items():
+                name = extract_company_name(rec)
+                domains = extract_company_domains(rec)
+                p = find_existing_company(companies_idx, name, domains)
+                if not p:
+                    continue
+                fm, body = read_page(p)
+                fm = merge_interaction_frontmatter(fm, rec, author_names)
+                fm = apply_company_location_frontmatter(fm, extract_primary_location(rec))
+                fm = apply_company_enrichment_frontmatter(fm, extract_company_enrichment(rec, domains))
+                if not args.dry_run:
+                    write_page_atomic(p, fm, body)
+                stats.interaction_metadata_updated += 1
+
+        if not args.dry_run and args.pass_name is None:
+            write_watermark_atomic(now_iso())
+            info(f"watermark advanced to {now_iso()}")
+
+        summary_path = write_run_summary(
+            stats,
+            mode=("dry-run" if args.dry_run else ("full" if args.full else "delta")),
+            since_iso=since_iso,
+        )
+
+    info("")
+    info("── Attio ingest complete ──")
+    for k, v in stats.as_dict().items():
+        info(f"  {k}: {v}")
+    if summary_path:
+        info(f"  summary: {summary_path}")
+    return 0
+
+
+def cmd_dry_run(args: argparse.Namespace) -> int:
+    args.dry_run = True
+    return cmd_run(args)
+
+
+# ─── Self-test ────────────────────────────────────────────────────────────────
+
+
+class _SelfTest(unittest.TestCase):
+    def test_slugify(self):
+        self.assertEqual(slugify("George Vives-Rouco"), "george-vives-rouco")
+        self.assertEqual(slugify("Moritz de Chaisemartin"), "moritz-de-chaisemartin")
+        self.assertEqual(slugify("Müller GmbH"), "muller-gmbh")
+        self.assertEqual(slugify(""), "")
+
+    def test_local_part(self):
+        self.assertEqual(_local_part("Foo.Bar@Example.com"), "foo.bar")
+        self.assertEqual(_local_part("noemail"), "")
+
+    def test_is_uuid(self):
+        self.assertTrue(_is_uuid("bd043199-74d2-467c-9de2-791f0c93daa6"))
+        self.assertFalse(_is_uuid("not-a-uuid"))
+        self.assertFalse(_is_uuid(None))
+
+    def test_scrub_injection_image_tag(self):
+        s = "Hello ![alt](https://evil.com/img.png) world"
+        self.assertEqual(scrub_content(s), "Hello  world")
+
+    def test_scrub_injection_external_link(self):
+        s = "Click [here](https://evil.com) now"
+        self.assertEqual(scrub_content(s), "Click here now")
+
+    def test_scrub_injection_js_link(self):
+        s = "Click [text](javascript:alert(1))"
+        self.assertEqual(scrub_content(s), "Click text")
+
+    def test_scrub_injection_script_tag(self):
+        s = "Hi <script>evil()</script> there"
+        self.assertEqual(scrub_content(s), "Hi  there")
+
+    def test_scrub_injection_control_chars(self):
+        s = "tab\there\x00null\x07bell\nnewline"
+        self.assertEqual(scrub_content(s), "tab\therenullbell\nnewline")
+
+    def test_frontmatter_roundtrip(self):
+        fm = {
+            "type": "person",
+            "title": "Tom Le Page",
+            "tags": ["stub", "attio-sourced"],
+            "aliases": ["Tom Le Page", "tom.lepage"],
+            "email": "tom.lepage@invictawealthsolutions.com",
+        }
+        rendered = render_frontmatter(fm)
+        parsed = _parse_frontmatter(rendered.split("---")[1])
+        self.assertEqual(parsed["type"], "person")
+        self.assertEqual(parsed["tags"], ["stub", "attio-sourced"])
+        self.assertEqual(parsed["aliases"], ["Tom Le Page", "tom.lepage"])
+        self.assertEqual(parsed["email"], "tom.lepage@invictawealthsolutions.com")
+
+    def test_quote_for_yaml_special_chars(self):
+        self.assertEqual(_quote_for_yaml("hello"), "hello")
+        self.assertEqual(_quote_for_yaml("with: colon"), '"with: colon"')
+        self.assertEqual(_quote_for_yaml("with, comma"), '"with, comma"')
+
+    def test_csv_split_with_quotes(self):
+        result = _split_csv('"Tom Le Page", "Tom", "tom.lepage"')
+        self.assertEqual([_unquote(x.strip()) for x in result],
+                         ["Tom Le Page", "Tom", "tom.lepage"])
+
+    def test_merge_aliases_dedup(self):
+        merged = merge_aliases(["Tom Le Page"], ["tom.lepage", "Tom Le Page"])
+        self.assertEqual(merged, ["Tom Le Page", "tom.lepage"])
+
+    def test_active_values_filters_inactive(self):
+        rec = {"values": {"name": [
+            {"full_name": "Old Name", "active_until": "2024-01-01"},
+            {"full_name": "Current Name", "active_until": None},
+        ]}}
+        self.assertEqual(extract_person_name(rec), "Current Name")
+
+    def test_clean_name_strips_quotes(self):
+        self.assertEqual(_clean_name("'Mats Blacker'"), "Mats Blacker")
+        self.assertEqual(_clean_name('"Foo Bar"'), "Foo Bar")
+        self.assertEqual(_clean_name("‘Smart Quoted’"), "Smart Quoted")
+        self.assertEqual(_clean_name("'\"Nested\"'"), "Nested")
+        self.assertEqual(_clean_name(""), "")
+        self.assertEqual(_clean_name("Mats  Blacker"), "Mats Blacker")  # collapse double space
+        self.assertEqual(_clean_name("  spaces  "), "spaces")
+        self.assertEqual(_clean_name("Don't Quote Me"), "Don't Quote Me")  # internal apostrophe survives
+
+    def test_extract_person_name_strips_attio_quotes(self):
+        rec = {"values": {"name": [
+            {"full_name": "'Mats  Blacker'", "active_until": None},
+        ]}}
+        self.assertEqual(extract_person_name(rec), "Mats Blacker")
+
+    def test_extract_person_name_structured(self):
+        rec = {"values": {"name": [
+            {"first_name": "George", "last_name": "Vives-Rouco", "active_until": None},
+        ]}}
+        self.assertEqual(extract_person_name(rec), "George Vives-Rouco")
+
+    def test_note_already_cited(self):
+        body = "## Timeline\n- 2026-05-01: foo [Source: attio-note:abc123 2026-05-01 (mid)]\n"
+        self.assertTrue(note_already_cited(body, "abc123"))
+        self.assertFalse(note_already_cited(body, "xyz999"))
+
+    def test_append_to_section_existing(self):
+        body = "## Recent Activity\n\n- old line\n\n## Timeline\n\n- older\n"
+        out = append_to_section(body, "Recent Activity", "- new line")
+        self.assertIn("- new line", out)
+        self.assertLess(out.index("- new line"), out.index("## Timeline"))
+
+    def test_append_to_section_missing_creates_before_timeline(self):
+        body = "# Title\n\n## Timeline\n\n- foo\n"
+        out = append_to_section(body, "Recent Activity", "- new")
+        self.assertIn("## Recent Activity", out)
+        self.assertLess(out.index("## Recent Activity"), out.index("## Timeline"))
+
+    def test_interaction_filter_body(self):
+        bodies = build_interaction_filter("MID-123", "2026-05-19T00:00:00Z")
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("last_email_interaction", bodies[0]["filter"])
+        self.assertEqual(bodies[0]["filter"]["last_email_interaction"]["owner_member_id"], "MID-123")
+
+    def test_country_from_iso_known(self):
+        self.assertEqual(country_from_iso("GB"), "United Kingdom")
+        self.assertEqual(country_from_iso("US"), "United States")
+        self.assertEqual(country_from_iso("ch"), "Switzerland")  # case-insensitive
+
+    def test_country_from_iso_unknown_falls_through(self):
+        self.assertEqual(country_from_iso("ZZ"), "ZZ")
+        self.assertEqual(country_from_iso(""), "")
+        self.assertEqual(country_from_iso(None), "")
+
+    def test_extract_location_full(self):
+        rec = {"values": {"primary_location": [{
+            "attribute_type": "location",
+            "locality": "London", "region": "England",
+            "country_code": "GB", "active_until": None,
+        }]}}
+        loc = extract_primary_location(rec)
+        self.assertEqual(loc["locality"], "London")
+        self.assertEqual(loc["region"], "England")
+        self.assertEqual(loc["country_code"], "GB")
+        self.assertEqual(loc["country_name"], "United Kingdom")
+
+    def test_extract_location_partial(self):
+        rec = {"values": {"primary_location": [{
+            "attribute_type": "location",
+            "locality": "Somerville", "region": "Massachusetts",
+            "country_code": None, "active_until": None,
+        }]}}
+        loc = extract_primary_location(rec)
+        self.assertEqual(loc["locality"], "Somerville")
+        self.assertEqual(loc["country_code"], "")
+        self.assertEqual(loc["country_name"], "")
+
+    def test_extract_location_empty(self):
+        self.assertEqual(extract_primary_location({"values": {"primary_location": []}}), {})
+        self.assertEqual(extract_primary_location({}), {})
+        # All-null values → still empty (no useful data to surface)
+        rec = {"values": {"primary_location": [{
+            "attribute_type": "location",
+            "locality": None, "region": None, "country_code": None,
+            "active_until": None,
+        }]}}
+        self.assertEqual(extract_primary_location(rec), {})
+
+    def test_format_location_display(self):
+        self.assertEqual(format_location_display({"locality": "London", "country_name": "United Kingdom"}),
+                         "London, United Kingdom")
+        self.assertEqual(format_location_display({"locality": "Somerville", "region": "Massachusetts"}),
+                         "Somerville, Massachusetts")
+        self.assertEqual(format_location_display({"locality": "Berlin"}), "Berlin")
+        self.assertEqual(format_location_display({"country_name": "Singapore"}), "Singapore")
+        self.assertEqual(format_location_display({}), "")
+
+    def test_apply_person_location_frontmatter(self):
+        fm = {"type": "person", "title": "Thibault"}
+        loc = {"locality": "London", "region": "England",
+               "country_code": "GB", "country_name": "United Kingdom"}
+        out = apply_person_location_frontmatter(dict(fm), loc)
+        self.assertEqual(out["location"], "London, United Kingdom")
+        self.assertEqual(out["city"], "London")
+        self.assertEqual(out["country"], "United Kingdom")
+        self.assertNotIn("timezone", out)  # Attio doesn't provide; never written
+
+    def test_apply_person_location_empty_loc_is_noop(self):
+        fm = {"type": "person", "title": "X"}
+        out = apply_person_location_frontmatter(dict(fm), {})
+        self.assertEqual(out, fm)
+
+    def test_apply_company_location_frontmatter(self):
+        fm = {"type": "company", "title": "FirstStreet"}
+        loc = {"locality": "Cambridge", "region": "Cambridgeshire",
+               "country_code": "GB", "country_name": "United Kingdom"}
+        out = apply_company_location_frontmatter(dict(fm), loc)
+        self.assertEqual(out["hq_city"], "Cambridge")
+        self.assertEqual(out["hq_country"], "United Kingdom")
+        # Should NOT write person-only fields onto a company page.
+        self.assertNotIn("location", out)
+        self.assertNotIn("city", out)
+        self.assertNotIn("country", out)
+
+    def test_location_country_code_fallback_when_unknown(self):
+        loc = {"locality": "Reykjavik", "country_code": "ZZ", "country_name": "ZZ"}
+        fm = apply_person_location_frontmatter({}, loc)
+        self.assertEqual(fm["country"], "ZZ")
+        self.assertEqual(fm["location"], "Reykjavik, ZZ")
+
+    def test_render_frontmatter_location_key_order(self):
+        fm = {
+            "type": "person", "title": "T",
+            "aliases": ["T"], "city": "London",
+            "country": "United Kingdom", "location": "London, United Kingdom",
+            "attio_last_contact": "2026-05-19T00:00:00Z",
+        }
+        out = render_frontmatter(fm)
+        # location keys must appear before attio_* keys
+        self.assertLess(out.index("location:"), out.index("attio_last_contact:"))
+        self.assertLess(out.index("aliases:"), out.index("location:"))
+
+    def test_text_value_extractor(self):
+        rec = {"values": {"description": [
+            {"value": "Some bio text.", "attribute_type": "text", "active_until": None},
+        ]}}
+        self.assertEqual(_text_value(rec, "description"), "Some bio text.")
+        self.assertEqual(_text_value({}, "description"), "")
+        self.assertEqual(_text_value({"values": {"description": []}}, "description"), "")
+
+    def test_number_value_extractor(self):
+        rec = {"values": {"twitter_follower_count": [
+            {"value": 4052, "attribute_type": "number", "active_until": None},
+        ]}}
+        self.assertEqual(_number_value(rec, "twitter_follower_count"), 4052)
+        self.assertIsNone(_number_value({}, "twitter_follower_count"))
+
+    def test_select_value_extractor_single_and_multi(self):
+        rec = {"values": {"estimated_arr_usd": [
+            {"option": {"title": "$1M-$10M"}, "attribute_type": "select", "active_until": None},
+        ]}}
+        self.assertEqual(_select_value(rec, "estimated_arr_usd"), "$1M-$10M")
+        rec_multi = {"values": {"categories": [
+            {"option": {"title": "Renewables & Environment"}, "active_until": None},
+            {"option": {"title": "B2B"}, "active_until": None},
+            {"option": {"title": "Renewables & Environment"}, "active_until": None},  # dup
+        ]}}
+        self.assertEqual(_select_multi_values(rec_multi, "categories"),
+                         ["Renewables & Environment", "B2B"])  # dedup preserves order
+
+    def test_date_value_extractor(self):
+        rec = {"values": {"foundation_date": [
+            {"value": "2011-01-01", "attribute_type": "date", "active_until": None},
+        ]}}
+        self.assertEqual(_date_value(rec, "foundation_date"), "2011-01-01")
+
+    def test_phone_value_extractor(self):
+        rec = {"values": {"phone_numbers": [
+            {"phone_number": "+17605356798", "country_code": "US",
+             "attribute_type": "phone-number", "active_until": None},
+        ]}}
+        self.assertEqual(_phone_value(rec), "+17605356798")
+        self.assertEqual(_phone_value({}), "")
+
+    def test_currency_value_extractor_defensive_keys(self):
+        # Try currency_value first
+        rec1 = {"values": {"funding_raised_usd": [
+            {"currency_value": 5000000, "currency_code": "USD",
+             "attribute_type": "currency", "active_until": None},
+        ]}}
+        self.assertEqual(_currency_value(rec1, "funding_raised_usd"), 5000000)
+        # Fall back to value
+        rec2 = {"values": {"funding_raised_usd": [
+            {"value": 2500000, "attribute_type": "currency", "active_until": None},
+        ]}}
+        self.assertEqual(_currency_value(rec2, "funding_raised_usd"), 2500000)
+        self.assertIsNone(_currency_value({}, "funding_raised_usd"))
+
+    def test_extract_person_enrichment_full(self):
+        rec = {"values": {
+            "linkedin": [{"value": "https://linkedin.com/in/foo", "active_until": None}],
+            "twitter": [{"value": "https://x.com/foo", "active_until": None}],
+            "twitter_follower_count": [{"value": 277, "active_until": None}],
+            "phone_numbers": [{"phone_number": "+17605356798", "active_until": None}],
+            "description": [{"value": "Bio sentence.", "active_until": None}],
+        }}
+        out = extract_person_enrichment(rec)
+        self.assertEqual(out["linkedin"], "https://linkedin.com/in/foo")
+        self.assertEqual(out["twitter"], "https://x.com/foo")
+        self.assertEqual(out["twitter_followers"], 277)
+        self.assertEqual(out["phone"], "+17605356798")
+        self.assertEqual(out["description"], "Bio sentence.")
+
+    def test_extract_person_enrichment_empty_record(self):
+        self.assertEqual(extract_person_enrichment({}), {})
+        self.assertEqual(extract_person_enrichment({"values": {}}), {})
+
+    def test_extract_company_enrichment_full(self):
+        rec = {"values": {
+            "description": [{"value": "Co description.", "active_until": None}],
+            "linkedin": [{"value": "https://linkedin.com/company/x", "active_until": None}],
+            "twitter": [{"value": "https://x.com/co", "active_until": None}],
+            "twitter_follower_count": [{"value": 4052, "active_until": None}],
+            "employee_range": [{"option": {"title": "11-50"}, "active_until": None}],
+            "foundation_date": [{"value": "2011-01-01", "active_until": None}],
+            "categories": [
+                {"option": {"title": "Renewables & Environment"}, "active_until": None},
+                {"option": {"title": "B2B"}, "active_until": None},
+            ],
+            "estimated_arr_usd": [{"option": {"title": "$1M-$10M"}, "active_until": None}],
+        }}
+        out = extract_company_enrichment(rec, ["cambridgecleantech.org.uk"])
+        self.assertEqual(out["website"], "https://cambridgecleantech.org.uk")
+        self.assertEqual(out["description"], "Co description.")
+        self.assertEqual(out["linkedin"], "https://linkedin.com/company/x")
+        self.assertEqual(out["twitter_followers"], 4052)
+        self.assertEqual(out["employee_range"], "11-50")
+        self.assertEqual(out["founded_year"], 2011)
+        self.assertEqual(out["categories"], ["Renewables & Environment", "B2B"])
+        # industry field is intentionally NOT written (per Marcus 2026-05-20 — raw categories speak for themselves)
+        self.assertNotIn("industry", out)
+        self.assertEqual(out["arr_band"], "$1M-$10M")
+        self.assertNotIn("total_funding_usd", out)  # not in input → not written
+
+    def test_extract_company_enrichment_no_domains(self):
+        rec = {"values": {"description": [{"value": "x", "active_until": None}]}}
+        out = extract_company_enrichment(rec, [])
+        self.assertNotIn("website", out)  # no domains → no synthesized URL
+        self.assertEqual(out["description"], "x")
+
+    def test_founded_year_handles_short_or_bad_date(self):
+        rec_short = {"values": {"foundation_date": [{"value": "2011", "active_until": None}]}}
+        self.assertEqual(extract_company_enrichment(rec_short, [])["founded_year"], 2011)
+        rec_bad = {"values": {"foundation_date": [{"value": "abc-de-fg", "active_until": None}]}}
+        self.assertNotIn("founded_year", extract_company_enrichment(rec_bad, []))
+
+    def test_company_enrichment_currency_handles_unverified_shape(self):
+        rec = {"values": {"funding_raised_usd": [
+            {"currency_value": 7500000, "currency_code": "USD", "active_until": None},
+        ]}}
+        out = extract_company_enrichment(rec, [])
+        self.assertEqual(out["total_funding_usd"], 7500000)
+
+    def test_enrichment_description_is_scrubbed(self):
+        rec = {"values": {"description": [
+            {"value": "Bio with [link](https://evil.com) and ![](img.png)", "active_until": None},
+        ]}}
+        self.assertEqual(extract_person_enrichment(rec)["description"], "Bio with link and ")
+
+    def test_apply_person_enrichment_overwrites_attio_fields(self):
+        fm = {"type": "person", "linkedin": "old-value"}
+        out = apply_person_enrichment_frontmatter(fm, {"linkedin": "new"})
+        self.assertEqual(out["linkedin"], "new")
+
+    def test_apply_enrichment_empty_dict_is_noop(self):
+        fm = {"type": "person", "title": "X"}
+        self.assertEqual(apply_person_enrichment_frontmatter(dict(fm), {}), fm)
+        self.assertEqual(apply_company_enrichment_frontmatter(dict(fm), {}), fm)
+
+    def test_render_frontmatter_field_order_enrichment(self):
+        fm = {
+            "type": "company", "title": "C", "aliases": ["C"],
+            "hq_city": "Cambridge", "hq_country": "United Kingdom",
+            "website": "https://c.com", "linkedin": "https://linkedin.com/company/c",
+            "founded_year": 2011,
+            "categories": ["Renewables", "B2B"],
+            "description": "Long description here",
+            "attio_last_contact": "2026-05-19T00:00:00Z",
+        }
+        out = render_frontmatter(fm)
+        # location must precede social
+        self.assertLess(out.index("hq_country:"), out.index("linkedin:"))
+        # social must precede company facts
+        self.assertLess(out.index("linkedin:"), out.index("website:"))
+        # company facts must precede description
+        self.assertLess(out.index("founded_year:"), out.index("description:"))
+        # categories present (no industry field by design)
+        self.assertIn("categories:", out)
+        self.assertNotIn("\nindustry:", out)
+        # everything in preferred list must precede attio_* metadata
+        self.assertLess(out.index("description:"), out.index("attio_last_contact:"))
+
+    def test_attio_last_owner_resolves_via_author_names(self):
+        rec = {"values": {"last_email_interaction": [
+            {"attribute_type": "interaction", "interaction_type": "email",
+             "interacted_at": "2026-05-19T10:00:00Z",
+             "owner_actor": {"type": "workspace-member", "id": "9735bf8b-aaaa-bbbb-cccc-000000000000"},
+             "active_until": None},
+        ]}}
+        author_names = {"9735bf8b-aaaa-bbbb-cccc-000000000000": "Peter Robson"}
+        out = merge_interaction_frontmatter({}, rec, author_names)
+        self.assertEqual(out["attio_last_owner"], "Peter Robson")
+
+    def test_attio_last_owner_falls_back_to_mid_when_unknown(self):
+        rec = {"values": {"last_email_interaction": [
+            {"attribute_type": "interaction", "interaction_type": "email",
+             "interacted_at": "2026-05-19T10:00:00Z",
+             "owner_actor": {"type": "workspace-member", "id": "deadbeef-aaaa-bbbb-cccc-000000000000"},
+             "active_until": None},
+        ]}}
+        out = merge_interaction_frontmatter({}, rec, {})
+        self.assertEqual(out["attio_last_owner"], "deadbeef-aaaa-bbbb-cccc-000000000000")
+        out2 = merge_interaction_frontmatter({}, rec, None)
+        self.assertEqual(out2["attio_last_owner"], "deadbeef-aaaa-bbbb-cccc-000000000000")
+
+    def test_format_note_strips_external_links(self):
+        note = {
+            "id": {"note_id": "nid-1"},
+            "created_at": "2026-05-12T10:00:00Z",
+            "title": "Initial",
+            "content_plaintext": "See [evil](https://x.com) and ![](img.png)",
+            "created_by_actor": {"id": "mid-abc"},
+        }
+        line = format_note_timeline_line(note)
+        self.assertIn("attio-note:nid-1", line)
+        self.assertIn("2026-05-12", line)
+        self.assertNotIn("https://x.com", line)
+        self.assertNotIn("![](", line)
+
+
+def cmd_self_test(args: argparse.Namespace) -> int:
+    loader = unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(_SelfTest)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="attio-ingest",
+        description="Pull Attio CRM data into ~/brain/{people,companies}/.",
+    )
+    p.add_argument("--full", action="store_true", help="ignore watermark; full re-pull")
+    p.add_argument("--dry-run", action="store_true", help="show counts; no writes")
+    p.add_argument("--stats", action="store_true", help="record counts only; no writes")
+    p.add_argument("--self-test", action="store_true", help="run inline unit tests")
+    p.add_argument("--pass", dest="pass_name", choices=["people", "notes", "interactions"],
+                   help="run only one pass")
+    p.add_argument("--full-org", action="store_true",
+                   help="bypass Marcus-only interaction filter (full team CRM)")
+    p.add_argument("--enrich-notes", action="store_true",
+                   help="(reserved for v2 — Haiku entity extraction; not implemented yet)")
+    p.add_argument("--yes-first-run", action="store_true",
+                   help="acknowledge that this is the first live run (no watermark exists)")
+    p.add_argument("--limit", type=int, default=0, metavar="N",
+                   help="stop fetching after N qualifying records per object "
+                        "(dry-run/stats sampling; 0=no limit)")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.self_test:
+        return cmd_self_test(args)
+    if args.enrich_notes:
+        info("--enrich-notes: deferred to a future Haiku pass; not implemented yet")
+        return 64
+    try:
+        if args.stats:
+            return cmd_stats(args)
+        return cmd_run(args)
+    except AttioAuthMissingError as e:
+        info(f"ERROR: {e}")
+        return 2
+    except (AttioAuthError, AttioScopeError) as e:
+        info(f"ERROR (auth): {e}")
+        info("  rotate the key or grant the missing scope at Attio workspace settings")
+        return 2
+    except MarcusNotFoundError as e:
+        info(f"ERROR: {e}")
+        return 3
+    except LockHeldError as e:
+        info(f"ERROR: {e}")
+        return 5
+    except (AttioFetchError, AttioRateLimitError, AttioWriteError, AttioFilterError) as e:
+        info(f"ERROR: {e}")
+        return 1
+    except KeyboardInterrupt:
+        info("interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

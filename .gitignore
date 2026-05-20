@@ -3,3 +3,7 @@ __pycache__/
 .DS_Store
 *.bak-*
 *.swp
+
+# attio-ingest runtime state (watermark + cached workspace_member_id)
+.last-attio-sync
+.attio-marcus-mid
