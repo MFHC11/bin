@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-20",
+  "purpose": "ERV electrification thesis watchlist. Source of truth for ~/bin/x-ingest signal collector. The collector reconciles this against the matching private X List at run start.",
+  "list_id": null,
+  "_comment_list_id": "Populated once by `x-ingest --setup` after creating the private X List of all 26 members. Required for the steady-state delta path (GET /2/lists/{id}/tweets). Backfill works without it.",
+  "_meta": {
+    "active_count": 26,
+    "tier_counts": {"1": 12, "2": 9, "3": 5}
+  },
+  "accounts": [
+    {
+      "tier": 1,
+      "user_id": "22751329",
+      "handle": "NatBullard",
+      "name": "Nat Bullard",
+      "primary_channel": "newsletter",
+      "relevance_note": "Independent energy/transition analyst, runs Sightlines newsletter. Best data viz on transition pace; X carries his real-time annotations and hot-takes. Newsletter is primary source; X is supplement."
+    },
+    {
+      "tier": 1,
+      "user_id": "2666969059",
+      "handle": "_HannahRitchie",
+      "name": "Hannah Ritchie",
+      "primary_channel": "newsletter",
+      "relevance_note": "Our World in Data, climate/energy. Data-led, methodologically careful, frequently surfaces under-noticed trend lines. Site/newsletter primary; X is shortform commentary."
+    },
+    {
+      "tier": 1,
+      "user_id": "17026589",
+      "handle": "JesseJenkins",
+      "name": "Jesse Jenkins",
+      "primary_channel": "x",
+      "relevance_note": "Princeton ZERO Lab. US grid/transmission/IRA policy, Wright's-Law thinking. X is his primary public venue for hot takes between papers. High signal-per-tweet."
+    },
+    {
+      "tier": 1,
+      "user_id": "1233150686704988160",
+      "handle": "rewiringamerica",
+      "name": "Rewiring America",
+      "primary_channel": "x",
+      "relevance_note": "Org account substituted for personal handle (@SaulGriffith inactive). Electrification advocacy, residential heat-pump / induction / EV adoption messaging. US policy-relevant."
+    },
+    {
+      "tier": 1,
+      "user_id": "22481472",
+      "handle": "MLiebreich",
+      "name": "Michael Liebreich",
+      "primary_channel": "x",
+      "relevance_note": "BNEF founder, podcast host (Cleaning Up). Energy transition macro, hydrogen-skeptic stance, useful contrarian-but-rigorous voice on capex pace and tech maturity."
+    },
+    {
+      "tier": 1,
+      "user_id": "6044272",
+      "handle": "ramez",
+      "name": "Ramez Naam",
+      "primary_channel": "x",
+      "relevance_note": "Climate futurist, ex-Microsoft, learning-curve evangelist. Strong signal for solar/battery/EV cost-curve milestones and 'when does X cross over' framing."
+    },
+    {
+      "tier": 1,
+      "user_id": "16933019",
+      "handle": "AukeHoekstra",
+      "name": "Auke Hoekstra",
+      "primary_channel": "x",
+      "relevance_note": "TU Eindhoven researcher. Methodologically rigorous EV/transition debunks. Catches bad analysis from oil/gas-funded studies. Essential for sanity-checking incoming claims."
+    },
+    {
+      "tier": 1,
+      "user_id": "29545844",
+      "handle": "MateoJaramillo",
+      "name": "Mateo Jaramillo",
+      "primary_channel": "x",
+      "relevance_note": "Form Energy CEO (multi-day iron-air storage). Industry-insider POV on long-duration storage market, grid economics, customer-side reality."
+    },
+    {
+      "tier": 1,
+      "user_id": "20941733",
+      "handle": "JigarShahDC",
+      "name": "Jigar Shah",
+      "primary_channel": "x",
+      "relevance_note": "DOE Loan Programs Office director, ex-SunEdison founder, ex-Generate Capital. Project-finance signals for US clean energy at scale. Politics + capital flows."
+    },
+    {
+      "tier": 1,
+      "user_id": "613926689",
+      "handle": "CJHandmer",
+      "name": "Casey Handmer",
+      "primary_channel": "x",
+      "relevance_note": "Climate engineer, Terraform Industries founder. Concrete decarbonization tech (synfuels, direct-air capture, solar overbuild). Thinks in W/m^2 and learning-curves."
+    },
+    {
+      "tier": 1,
+      "user_id": "27708539",
+      "handle": "shaylekann",
+      "name": "Shayle Kann",
+      "primary_channel": "x",
+      "relevance_note": "Latitude Media co-founder, Catalyst podcast host. Climate-tech analyst-investor, surfaces under-known startups and category dynamics. Sharp on what's overhyped vs under-hyped."
+    },
+    {
+      "tier": 1,
+      "user_id": "1647573157",
+      "handle": "JavierBlas",
+      "name": "Javier Blas",
+      "primary_channel": "x",
+      "relevance_note": "Bloomberg commodities columnist. Oil/gas/LNG-side perspective on transition. Essential counterweight to electrons-only voices; surfaces real-world fossil incumbency dynamics."
+    },
+
+    {
+      "tier": 2,
+      "user_id": "1384579353217019906",
+      "handle": "DoombergT",
+      "name": "Doomberg",
+      "primary_channel": "substack",
+      "relevance_note": "Anonymous energy/markets Substack with contrarian POV (often nuclear-bullish, transition-skeptical). Substack is primary; X is teaser/commentary."
+    },
+    {
+      "tier": 2,
+      "user_id": "22737278",
+      "handle": "drvolts",
+      "name": "David Roberts",
+      "primary_channel": "newsletter",
+      "relevance_note": "Volts podcast/newsletter. Deep US energy policy expert, especially grid/electrification/heat-pumps. Newsletter primary; X carries hot reactions to policy news."
+    },
+    {
+      "tier": 2,
+      "user_id": "12428",
+      "handle": "codysimms",
+      "name": "Cody Simms",
+      "primary_channel": "x",
+      "relevance_note": "MCJ Collective, climate-tech VC and podcast. Sees deal flow signals, who's raising / what categories are hot. Investment-side intel."
+    },
+    {
+      "tier": 2,
+      "user_id": "29859347",
+      "handle": "andrewbeebe",
+      "name": "Andrew Beebe",
+      "primary_channel": "x",
+      "relevance_note": "Obvious Ventures partner (climate-tech). Long-horizon investor perspective; comments on portfolio category dynamics."
+    },
+    {
+      "tier": 2,
+      "user_id": "2349845856",
+      "handle": "JKempEnergy",
+      "name": "John Kemp",
+      "primary_channel": "x",
+      "relevance_note": "Veteran oil/energy analyst (ex-Reuters, now independent). Quantitative, data-led commentary on inventories, prices, supply/demand. Useful for incumbent-fuels framing."
+    },
+    {
+      "tier": 2,
+      "user_id": "94483582",
+      "handle": "Rory_Johnston",
+      "name": "Rory Johnston",
+      "primary_channel": "newsletter",
+      "relevance_note": "Commodity Context newsletter (oil markets). Newsletter primary; X carries inventory/spread observations."
+    },
+    {
+      "tier": 2,
+      "user_id": "851361",
+      "handle": "elidourado",
+      "name": "Eli Dourado",
+      "primary_channel": "x",
+      "relevance_note": "Growth/abundance/infrastructure policy. Useful for hyperscale-grid / permitting / regulatory-as-bottleneck framing. Often crosses electrification with AI compute demand."
+    },
+    {
+      "tier": 2,
+      "user_id": "1491226530",
+      "handle": "andykarsner",
+      "name": "Andy Karsner",
+      "primary_channel": "x",
+      "relevance_note": "Alphabet's X (formerly DOE Asst Secretary for Energy Efficiency under Bush). Big-picture energy-transition thinker; surfaces moonshot/innovation signals."
+    },
+    {
+      "tier": 2,
+      "user_id": "17348942",
+      "handle": "CostaSamaras",
+      "name": "Costa Samaras",
+      "primary_channel": "x",
+      "relevance_note": "Carnegie Mellon engineering prof, focus on energy/transport. Academic rigor on emissions accounting, transport electrification, climate-resilient infrastructure."
+    },
+
+    {
+      "tier": 3,
+      "user_id": "18625747",
+      "handle": "latitudemedia",
+      "name": "Latitude Media",
+      "primary_channel": "x",
+      "relevance_note": "Climate-tech media company (Shayle Kann's). Tracks for digest-only — content also reaches us through individual writer accounts in T1/T2."
+    },
+    {
+      "tier": 3,
+      "user_id": "105267145",
+      "handle": "BloombergNEF",
+      "name": "BloombergNEF",
+      "primary_channel": "x",
+      "relevance_note": "Energy/transition research shop. Headline data drops (annual outlooks, sector reports). Institutional voice, weekly digest cadence sufficient."
+    },
+    {
+      "tier": 3,
+      "user_id": "84679163",
+      "handle": "IEA",
+      "name": "International Energy Agency",
+      "primary_channel": "x",
+      "relevance_note": "Global energy reference body. Report releases and macro forecasts. Institutional voice, weekly digest cadence sufficient."
+    },
+    {
+      "tier": 3,
+      "user_id": "1356942170",
+      "handle": "ColumbiaUEnergy",
+      "name": "Columbia University Center on Global Energy Policy",
+      "primary_channel": "x",
+      "relevance_note": "Academic energy policy center. Workshop announcements, working-paper drops, conference signal."
+    },
+    {
+      "tier": 3,
+      "user_id": "263104127",
+      "handle": "OxfordEnergy",
+      "name": "Oxford Institute for Energy Studies",
+      "primary_channel": "x",
+      "relevance_note": "UK academic energy research. Gas/oil/LNG-specific scholarly output. Reaches us through individual researcher accounts in their own posts."
+    }
+  ],
+  "_dropped_v1": [
+    {"handle": "SaulGriffith", "reason": "Personal handle inactive on X. Substituted with @rewiringamerica org account (T1)."},
+    {"handle": "robbie_andrew", "reason": "Moved to Bluesky. Drop until cross-platform support added."},
+    {"handle": "SophieCPurdom", "reason": "Substack-only (Planeteer/CTVC). Tracked via newsletter pipeline, not X."},
+    {"handle": "kim_zou_", "reason": "Substack-only (CTVC). Tracked via newsletter pipeline, not X."},
+    {"handle": "vsivaram", "reason": "Account inactive (1 tweet, 0 followers). May reactivate; revisit later."},
+    {"handle": "ALubershane", "reason": "Account inactive (0 tweets, 0 followers). May reactivate; revisit later."},
+    {"handle": "KatieARae", "reason": "Real Katie Rae (Engine Ventures) handle not found on X. @kraetae candidate dropped as bot-like (46 followers / 216k tweets). Tag for later."},
+    {"handle": "g_jackson", "reason": "Wrong account at this handle. @GregJacksonOE also not found. Greg Jackson appears off X. Operationally relevant for UK electrification retail story; high-priority to track elsewhere."},
+    {"handle": "HeatmapNews", "reason": "Handle stale; @HeatmapClimate not found. Heatmap reaches us via individual writer accounts and email-to-brain."},
+    {"handle": "ctvcmedia", "reason": "CTVC is Substack-native. @ctvc_co not found on X. Tracked via newsletter pipeline."},
+    {"handle": "aekarsner", "reason": "Original handle inactive. Substituted with @andykarsner (T2)."}
+  ]
+}

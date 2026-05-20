@@ -1,0 +1,1985 @@
+#!/usr/bin/env python3
+"""x-ingest — pull curated X (Twitter) watchlist into ~/brain/ as electrification
+thesis signals.
+
+Source of truth for watchlist: ~/bin/config/x-watchlist.json (26 accounts in
+3 tiers as of 2026-05-20). Edit the JSON; the collector reconciles against
+its private X List at run start.
+
+Architecture (hybrid):
+  --backfill : per-handle pulls via GET /2/users/{id}/tweets, tiered window
+               (T1=90d, T2=30d, T3=7d). One-time.
+  --delta    : (default) Lists API pull via GET /2/lists/{id}/tweets, paginated,
+               since last watermark. Falls back to per-handle if List endpoint
+               errors. 2x/wk via brain-run Phase 7.
+  --setup    : create the private X List from the watchlist; write list_id back
+               into x-watchlist.json. Runs once at install.
+
+Signal filter:
+  - thesis-keyword match (THESIS_KEYWORDS)
+  - engagement gate: T1 = any post; T2/T3 = author-normalized z-score
+    (median + IQR), n>=15 author baseline required; absolute-threshold fallback
+    during backfill or for accounts below the baseline floor.
+  - thread-starter T1 posts pass without engagement
+  - cross-watchlist mention always passes
+
+Two-write pattern (transactional):
+  1. signal page at ~/brain/signals/YYYY-MM/<handle>-<post-id>.md
+  2. people timeline at ~/brain/people/<slug>.md  (append at ## Timeline)
+  Cursor advances only after both succeed. Failed people-write → reconcile queue.
+
+Narrative tracking: 3+ posts with >=2 keyword overlap AND >=1 rare keyword in
+7d window per handle -> annotate compiled truth with `expires: +90d` TTL.
+
+Auth: X_BEARER_TOKEN in macOS keychain. Cron fallback: ~/.gbrain/secrets.env.
+  security add-generic-password -a "$USER" -s X_BEARER_TOKEN -w '<token>'
+
+This script does not call brain-sync. brain-run --with-x invokes it as Phase 7.
+
+Schema: x-watchlist.json schema_version=1.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import json
+import math
+import os
+import re
+import ssl
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+BRAIN = Path.home() / "brain"
+PEOPLE_DIR = BRAIN / "people"
+SIGNALS_DIR = BRAIN / "signals"
+CONCEPTS_DIR = BRAIN / "concepts"
+TASKS_DIR = BRAIN / ".tasks"
+
+BIN_DIR = Path.home() / "bin"
+CONFIG_PATH = BIN_DIR / "config" / "x-watchlist.json"
+WATERMARK_PATH = BIN_DIR / ".last-x-sync"
+LOCK_PATH = BIN_DIR / ".x-ingest.lock"
+
+INTEGRATION_DIR = Path.home() / ".gbrain" / "integrations" / "x-to-brain"
+DATA_DIR = INTEGRATION_DIR / "data"
+TWEETS_DIR = DATA_DIR / "tweets"
+RECONCILE_DIR = DATA_DIR / "reconcile"
+STATE_PATH = DATA_DIR / "state.json"
+HEARTBEAT_PATH = INTEGRATION_DIR / "heartbeat.jsonl"
+SECRETS_ENV_PATH = Path.home() / ".gbrain" / "secrets.env"
+
+LOG_DIR = Path.home() / "logs"
+LOG_PATH = LOG_DIR / "x-ingest.log"
+
+X_BASE = "https://api.x.com/2"
+HTTP_TIMEOUT_S = 30
+MAX_RETRIES = 5
+PAGE_SIZE = 100  # X API user-tweets and list-tweets max per page
+WALL_CAP_S = 15 * 60  # 15-minute hard wall cap on a single run
+
+# Default budgets — overrideable via CLI.
+DEFAULT_MAX_READS = 5000
+HARD_PAGE_CAP = 60  # per-handle/per-list pagination safety cap
+
+# Backfill windows per tier (days).
+BACKFILL_DAYS = {1: 90, 2: 30, 3: 7}
+
+# Absolute engagement thresholds (fallback when z-score baseline n<15).
+# Tier 1 has no absolute gate — every Tier 1 post passes the engagement check.
+ENGAGEMENT_FLOOR = {
+    1: (0, 0),       # likes_floor, replies_floor: any post passes
+    2: (20, 5),      # >= 20 likes OR >= 5 replies
+    3: (100, 0),     # >= 100 likes
+}
+
+# Z-score (robust, median+IQR) threshold for "above usual" once baseline exists.
+Z_SCORE_THRESHOLD = 1.5
+Z_SCORE_MIN_SAMPLES = 15
+
+# Narrative tracking
+NARRATIVE_WINDOW_DAYS = 7
+NARRATIVE_MIN_POSTS = 3
+NARRATIVE_KEYWORD_OVERLAP_MIN = 2
+NARRATIVE_ANNOTATION_TTL_DAYS = 90
+RARE_KEYWORD_MAX_FREQ = 0.30  # appears in <30% of week's matched posts
+
+# Per-handle hard cap on posts to ingest from one run (anti-flood). Tier 1
+# accounts get a larger cap because they hold the highest signal density;
+# T2/T3 stay capped at 200 to avoid log-style accumulation.
+PER_HANDLE_HARD_CAP = 200
+PER_HANDLE_HARD_CAP_T1 = 400
+
+
+def hard_cap_for_tier(tier: int) -> int:
+    return PER_HANDLE_HARD_CAP_T1 if tier == 1 else PER_HANDLE_HARD_CAP
+
+# Signal page body cap.
+SIGNAL_BODY_CAP_BYTES = 8192
+
+# ─── Thesis keywords ──────────────────────────────────────────────────────────
+# Whole-word match against lowercased tweet text. Multi-word phrases use \b
+# boundaries; compound words handled via the keyword tokenization in
+# `extract_matched_keywords()`.
+
+THESIS_KEYWORDS: list[str] = sorted({
+    "battery", "batteries",
+    "electrolysis", "electrolyzer", "electrolyser",
+    "grid", "transmission", "interconnect", "interconnection",
+    "electrification", "electrify", "electrified",
+    "solar", "photovoltaic", "pv",
+    "wind", "turbine", "turbines",
+    "hydrogen", "h2",
+    "storage", "long-duration",
+    "ev", "evs", "electric vehicle", "electric vehicles",
+    "heat pump", "heat pumps",
+    "wright's law", "wrights law",
+    "learning curve", "learning rate",
+    "lcoe",
+    "capacity factor",
+    "electrons",
+    "watts", "kilowatt", "kilowatts", "megawatt", "megawatts",
+    "gigawatt", "gigawatts", "terawatt", "terawatts",
+    "kwh", "mwh", "gwh",
+    "joule", "joules",
+    "electrochemistry", "electrochemical",
+    "power electronics",
+    "inverter", "inverters",
+    "microgrid", "microgrids",
+    "vpp", "virtual power plant",
+    "flexibility",
+    "demand response",
+    "carbon", "emissions",
+    "decarbonisation", "decarbonization",
+    "transition",
+})
+
+# Pre-compiled match patterns: whole-word for single tokens; raw for phrases.
+_KW_PATTERNS: list[tuple[str, re.Pattern[str]]] = []
+for _kw in THESIS_KEYWORDS:
+    _esc = re.escape(_kw)
+    if " " in _kw or "-" in _kw or "'" in _kw:
+        _pat = re.compile(rf"(?<!\w){_esc}(?!\w)", re.IGNORECASE)
+    else:
+        _pat = re.compile(rf"\b{_esc}\b", re.IGNORECASE)
+    _KW_PATTERNS.append((_kw, _pat))
+
+
+# ─── Injection defense ────────────────────────────────────────────────────────
+# Mirrors attio-ingest; extended with reference-link, HTML-anchor, wikilink
+# strips per the 2026-05-20 adversarial review (findings #9 and #1-on-wikilink).
+# When attio-ingest is also updated to import from a shared module, this block
+# can be extracted; for now both files keep an inline copy.
+
+INJECTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"<script\b[^>]*>.*?</script>", re.I | re.DOTALL), ""),
+    (re.compile(r"<iframe\b[^>]*>.*?</iframe>", re.I | re.DOTALL), ""),
+    (re.compile(r"<a\b[^>]*>.*?</a>", re.I | re.DOTALL), ""),  # HTML anchors
+    (re.compile(r"<[a-zA-Z][^>]*on[a-z]+\s*=", re.I), "<"),  # inline event handlers
+    (re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]"), ""),  # control chars except \n \t \r
+    (re.compile(r"\[\[[^\]]*\]\]"), ""),  # wikilink injection
+    (re.compile(r"^\s*\[[^\]]+\]:\s*\S+\s*$", re.MULTILINE), ""),  # ref-style link defs
+]
+# Image and link patterns handle one level of nested parens; iterated to
+# fixpoint by scrub_content for deeper nesting.
+IMG_PATTERN = re.compile(r"!\[[^\]]*\]\((?:[^()]*\([^()]*\))*[^()]*\)")
+MD_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((?:[^()]*\([^()]*\))*[^()]*\)")
+
+
+def scrub_content(s: str) -> str:
+    """Strip injection patterns and markdown links from untrusted tweet text.
+    Iterates IMG_PATTERN and MD_LINK_PATTERN to a fixpoint (or max 8 iters)
+    to handle nested parens without unbounded backtracking on pathological
+    inputs."""
+    if not s:
+        return ""
+    for pat, repl in INJECTION_PATTERNS:
+        s = pat.sub(repl, s)
+    for _ in range(8):
+        new = IMG_PATTERN.sub("", s)
+        new = MD_LINK_PATTERN.sub(r"\1", new)
+        if new == s:
+            break
+        s = new
+    return s
+
+
+# ─── Errors ───────────────────────────────────────────────────────────────────
+
+
+class XIngestError(Exception):
+    """Base for all x-ingest failures. Never silently swallowed."""
+
+
+class XAuthMissingError(XIngestError):
+    pass
+
+
+class XAuthError(XIngestError):
+    pass
+
+
+class XCreditsDepletedError(XIngestError):
+    pass
+
+
+class XRateLimitError(XIngestError):
+    pass
+
+
+class XServerError(XIngestError):
+    pass
+
+
+class XResponseParseError(XIngestError):
+    pass
+
+
+class XConfigError(XIngestError):
+    pass
+
+
+class XReadBudgetExhausted(XIngestError):
+    pass
+
+
+class XWallClockExceeded(XIngestError):
+    pass
+
+
+class XWriteError(XIngestError):
+    pass
+
+
+class XLockHeldError(XIngestError):
+    pass
+
+
+# ─── Logging / timing ─────────────────────────────────────────────────────────
+
+
+def _log_jsonl(event: str, **kwargs: Any) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": now_iso(), "event": event, **kwargs}
+    try:
+        with LOG_PATH.open("a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except OSError:
+        pass  # never let logging tank the run
+
+
+def info(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def stdout_contract(line: str) -> None:
+    """Structured line that brain-run Phase 7 can parse."""
+    print(line, flush=True)
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def today_iso() -> str:
+    return dt.date.today().isoformat()
+
+
+def parse_iso(s: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# ─── SSL context (Python.org installer compatibility) ─────────────────────────
+
+
+def _make_ssl_context() -> ssl.SSLContext:
+    candidates: list[str | None] = [
+        os.environ.get("SSL_CERT_FILE"),
+        os.environ.get("REQUESTS_CA_BUNDLE"),
+    ]
+    py_etc = Path(sys.prefix) / "etc" / "openssl" / "cert.pem"
+    if py_etc.is_file():
+        candidates.append(str(py_etc))
+    if Path("/etc/ssl/cert.pem").is_file():
+        candidates.append("/etc/ssl/cert.pem")
+    for c in candidates:
+        if c and Path(c).is_file():
+            return ssl.create_default_context(cafile=c)
+    return ssl.create_default_context()
+
+
+_SSL_CTX = _make_ssl_context()
+
+
+# ─── Auth ─────────────────────────────────────────────────────────────────────
+
+
+def load_bearer_token() -> str:
+    """Resolve X_BEARER_TOKEN. Keychain first; ~/.gbrain/secrets.env fallback
+    for cron contexts where the keychain is locked."""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if user:
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password", "-a", user, "-s", "X_BEARER_TOKEN", "-w"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            if r.returncode == 0:
+                tok = (r.stdout or "").strip()
+                if tok:
+                    return tok
+        except subprocess.TimeoutExpired:
+            pass
+
+    # Cron fallback.
+    if SECRETS_ENV_PATH.is_file():
+        for line in SECRETS_ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("X_BEARER_TOKEN="):
+                tok = line.split("=", 1)[1].strip().strip("'\"")
+                if tok:
+                    return tok
+
+    raise XAuthMissingError(
+        "X_BEARER_TOKEN not found.\n"
+        "Add to keychain:\n"
+        "  security add-generic-password -a \"$USER\" -s X_BEARER_TOKEN -w '<token>'\n"
+        "Or to ~/.gbrain/secrets.env for cron contexts:\n"
+        "  X_BEARER_TOKEN=<token>"
+    )
+
+
+# ─── HTTP ─────────────────────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass
+class ReadBudget:
+    """Per-run cap on number of API reads (not credits — X bills opaquely)."""
+    max_reads: int
+    used: int = 0
+
+    def consume(self, n: int = 1) -> None:
+        self.used += n
+        if self.used > self.max_reads:
+            raise XReadBudgetExhausted(
+                f"hit max-reads cap {self.max_reads} (consumed {self.used})"
+            )
+
+
+@dataclasses.dataclass
+class WallClock:
+    """Hard wall-clock cap on a single run."""
+    started_at: float = dataclasses.field(default_factory=time.monotonic)
+    cap_s: float = WALL_CAP_S
+
+    def check(self) -> None:
+        if (time.monotonic() - self.started_at) > self.cap_s:
+            raise XWallClockExceeded(f"wall clock exceeded {self.cap_s}s")
+
+
+def x_request(
+    method: str,
+    path: str,
+    token: str,
+    body: dict | None = None,
+    params: dict | None = None,
+    *,
+    budget: ReadBudget | None = None,
+    wall: WallClock | None = None,
+) -> tuple[int, Any]:
+    """One X v2 call with typed errors + retry.
+
+    402 CreditsDepleted -> XCreditsDepletedError (no retry, hard stop)
+    401 -> XAuthError (no retry)
+    429 -> respect x-rate-limit-reset, sleep, retry
+    5xx -> exp backoff, retry up to MAX_RETRIES
+    """
+    url = X_BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    raw_body = json.dumps(body).encode() if body is not None else None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "x-ingest/0.1 (+brain)",
+    }
+    if raw_body is not None:
+        headers["Content-Type"] = "application/json"
+
+    if wall:
+        wall.check()
+    if budget and method == "GET":
+        budget.consume(1)
+
+    backoff = 1.0
+    last_err = ""
+    for attempt in range(1, MAX_RETRIES + 1):
+        t0 = time.monotonic()
+        req = urllib.request.Request(url, data=raw_body, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S, context=_SSL_CTX) as resp:
+                status = resp.status
+                payload = resp.read()
+                dur_ms = int((time.monotonic() - t0) * 1000)
+                _log_jsonl("http", method=method, path=path, status=status,
+                           duration_ms=dur_ms, attempt=attempt)
+                if not payload:
+                    return status, {}
+                try:
+                    return status, json.loads(payload)
+                except json.JSONDecodeError as e:
+                    raise XResponseParseError(f"200 OK but unparseable JSON from {path}: {e}")
+        except urllib.error.HTTPError as e:
+            status = e.code
+            try:
+                err_body = json.loads(e.read().decode()[:8192])
+                err_msg = err_body.get("detail") or err_body.get("title") or str(err_body)[:400]
+            except (json.JSONDecodeError, UnicodeDecodeError, AttributeError, OSError):
+                err_msg = "<unparseable body>"
+            dur_ms = int((time.monotonic() - t0) * 1000)
+            _log_jsonl("http", method=method, path=path, status=status,
+                       duration_ms=dur_ms, attempt=attempt, error=err_msg)
+            if status == 401:
+                raise XAuthError(f"401 unauthorised: {err_msg}")
+            if status == 402:
+                raise XCreditsDepletedError(f"402 credits depleted: {err_msg}")
+            if status in (403, 404):
+                # 403 = forbidden endpoint, 404 = resource not found. Both terminal.
+                raise XServerError(f"{status} {err_msg}")
+            if status == 429:
+                # Sleep until rate-limit-reset if header present; else backoff.
+                reset = e.headers.get("x-rate-limit-reset")
+                sleep_s = backoff
+                if reset:
+                    try:
+                        sleep_s = max(1.0, float(reset) - time.time())
+                    except ValueError:
+                        pass
+                sleep_s = min(sleep_s, 120)
+                if attempt >= MAX_RETRIES:
+                    raise XRateLimitError(f"429 after {MAX_RETRIES} retries")
+                info(f"  429 -> sleep {sleep_s:.1f}s (attempt {attempt}/{MAX_RETRIES})")
+                if wall:
+                    wall.check()
+                time.sleep(sleep_s)
+                continue
+            if 500 <= status < 600:
+                if attempt >= MAX_RETRIES:
+                    raise XServerError(f"{status} after {MAX_RETRIES} retries: {err_msg}")
+                info(f"  {status} -> backoff {backoff:.1f}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            # Any other 4xx is permanent.
+            raise XServerError(f"{status}: {err_msg}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = repr(e)
+            _log_jsonl("http", method=method, path=path, status=0,
+                       attempt=attempt, error=last_err)
+            if attempt >= MAX_RETRIES:
+                raise XServerError(f"network failure after {MAX_RETRIES}: {last_err}")
+            info(f"  network err -> backoff {backoff:.1f}s: {last_err}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+    raise XServerError(f"exhausted retries: {last_err}")
+
+
+def x_paged(
+    path: str,
+    token: str,
+    params: dict,
+    *,
+    budget: ReadBudget,
+    wall: WallClock,
+    page_cap: int = HARD_PAGE_CAP,
+    since_id: str | None = None,
+) -> Iterator[tuple[dict, dict]]:
+    """Iterate paginated results. Yields (tweet_obj, includes_users_by_id).
+    `since_id` short-circuits backwards iteration via the pagination_token only
+    if the endpoint supports it; otherwise we filter client-side."""
+    next_token: str | None = None
+    pages = 0
+    while True:
+        if pages >= page_cap:
+            info(f"  hit page cap {page_cap} on {path}; stopping pagination")
+            return
+        qp = dict(params)
+        if next_token:
+            qp["pagination_token"] = next_token
+        status, data = x_request("GET", path, token, params=qp,
+                                 budget=budget, wall=wall)
+        if not isinstance(data, dict):
+            return
+        users_by_id: dict[str, dict] = {}
+        for u in (data.get("includes") or {}).get("users", []):
+            uid = u.get("id")
+            if uid:
+                users_by_id[uid] = u
+        for tw in data.get("data", []) or []:
+            yield tw, users_by_id
+        meta = data.get("meta") or {}
+        next_token = meta.get("next_token")
+        if not next_token:
+            return
+        pages += 1
+
+
+# ─── Watchlist config ─────────────────────────────────────────────────────────
+
+
+@dataclasses.dataclass
+class WatchAccount:
+    tier: int
+    user_id: str
+    handle: str
+    name: str
+    primary_channel: str
+    relevance_note: str
+
+
+@dataclasses.dataclass
+class Watchlist:
+    list_id: str | None
+    accounts: list[WatchAccount]
+    raw: dict  # for write-back
+
+    def by_user_id(self) -> dict[str, WatchAccount]:
+        return {a.user_id: a for a in self.accounts}
+
+    def by_handle_lower(self) -> dict[str, WatchAccount]:
+        return {a.handle.lower(): a for a in self.accounts}
+
+
+def load_watchlist() -> Watchlist:
+    if not CONFIG_PATH.is_file():
+        raise XConfigError(f"watchlist config missing: {CONFIG_PATH}")
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as e:
+        raise XConfigError(f"watchlist JSON parse: {e}")
+    if not isinstance(raw, dict):
+        raise XConfigError("watchlist root is not an object")
+    if raw.get("schema_version") != 1:
+        raise XConfigError(f"unsupported schema_version: {raw.get('schema_version')!r}")
+    accts: list[WatchAccount] = []
+    seen_ids: set[str] = set()
+    for i, a in enumerate(raw.get("accounts", [])):
+        try:
+            uid = str(a["user_id"])
+            if uid in seen_ids:
+                raise XConfigError(f"duplicate user_id {uid} in account {i}")
+            seen_ids.add(uid)
+            tier = int(a["tier"])
+            if tier not in (1, 2, 3):
+                raise XConfigError(f"invalid tier {tier} in account {i}")
+            accts.append(WatchAccount(
+                tier=tier,
+                user_id=uid,
+                handle=str(a["handle"]),
+                name=str(a["name"]),
+                primary_channel=str(a.get("primary_channel", "x")),
+                relevance_note=str(a.get("relevance_note", "")),
+            ))
+        except KeyError as e:
+            raise XConfigError(f"account {i} missing field {e}")
+    return Watchlist(
+        list_id=raw.get("list_id"),
+        accounts=accts,
+        raw=raw,
+    )
+
+
+def save_watchlist_list_id(wl: Watchlist, list_id: str) -> None:
+    wl.raw["list_id"] = list_id
+    tmp = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(wl.raw, indent=2) + "\n")
+    tmp.replace(CONFIG_PATH)
+
+
+# ─── State ────────────────────────────────────────────────────────────────────
+#
+# state.json keys ALL on numeric user_id (per adversarial review #11).
+# Schema:
+# {
+#   "schema_version": 1,
+#   "last_run_at": "...",
+#   "backfill_complete": false,
+#   "per_handle_cursor": {"<user_id>": "<oldest_seen_post_id>"},
+#   "per_handle_done": {"<user_id>": true},   # backfill window covered
+#   "list_cursor": "<last_seen_post_id>",
+#   "rate_limit_snapshot": {"endpoint": {"remaining": int, "reset": int}},
+#   "narrative_counters": {"<user_id>": [{"week": "YYYY-WW", "kw": [...], "ids":[...]}]},
+#   "reads_total": 0
+# }
+
+
+_STATE_DEFAULTS: dict[str, Any] = {
+    "schema_version": 1,
+    "last_run_at": None,
+    "backfill_complete": False,
+    "per_handle_cursor": {},
+    "per_handle_done": {},
+    "list_cursor": None,
+    "rate_limit_snapshot": {},
+    "narrative_counters": {},
+    "list_add_failures": {},
+    "reads_total": 0,
+}
+
+
+def load_state() -> dict:
+    if not STATE_PATH.is_file():
+        return dict(_STATE_DEFAULTS)
+    try:
+        loaded = json.loads(STATE_PATH.read_text())
+    except json.JSONDecodeError as e:
+        raise XConfigError(
+            f"state.json corrupt: {e}; refusing partial run. "
+            f"Delete {STATE_PATH} to reset (loses cursors)."
+        )
+    if not isinstance(loaded, dict):
+        raise XConfigError("state.json root is not an object")
+    schema = loaded.get("schema_version", 1)
+    if schema != 1:
+        raise XConfigError(f"unsupported state.json schema_version={schema!r}")
+    # Forward-compat: merge with defaults so older state files that predate a
+    # new key don't blow up on KeyError mid-run.
+    merged = dict(_STATE_DEFAULTS)
+    merged.update(loaded)
+    return merged
+
+
+def save_state_atomic(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(STATE_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    tmp.replace(STATE_PATH)
+
+
+# ─── Lock ─────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def acquire_lock() -> Iterator[None]:
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    if LOCK_PATH.exists():
+        try:
+            other_pid = int(LOCK_PATH.read_text().strip())
+            os.kill(other_pid, 0)
+            raise XLockHeldError(f"another x-ingest is running (pid {other_pid})")
+        except (ValueError, ProcessLookupError, PermissionError):
+            info(f"  stale lock {LOCK_PATH}; removing")
+            try:
+                LOCK_PATH.unlink()
+            except OSError:
+                pass
+    LOCK_PATH.write_text(str(os.getpid()) + "\n")
+    try:
+        yield
+    finally:
+        try:
+            LOCK_PATH.unlink()
+        except OSError:
+            pass
+
+
+# ─── Tweet shape helpers ──────────────────────────────────────────────────────
+
+
+def tweet_is_retweet(tw: dict) -> bool:
+    """True only for plain retweets (RT @... without comment)."""
+    for ref in tw.get("referenced_tweets") or []:
+        if ref.get("type") == "retweeted":
+            return True
+    # Heuristic: starts with "RT @"
+    txt = (tw.get("text") or "").lstrip()
+    return txt.startswith("RT @")
+
+
+def tweet_is_quote(tw: dict) -> bool:
+    for ref in tw.get("referenced_tweets") or []:
+        if ref.get("type") == "quoted":
+            return True
+    return False
+
+
+def tweet_is_reply(tw: dict) -> bool:
+    for ref in tw.get("referenced_tweets") or []:
+        if ref.get("type") == "replied_to":
+            return True
+    return tw.get("in_reply_to_user_id") is not None
+
+
+def tweet_is_thread_starter(tw: dict, author_id: str) -> bool:
+    """Heuristic: tweet not in reply to anyone, or replying only to self."""
+    if not tweet_is_reply(tw):
+        return True
+    parent_uid = tw.get("in_reply_to_user_id")
+    return parent_uid == author_id
+
+
+def tweet_metrics(tw: dict) -> dict[str, int]:
+    """Returns {likes, replies, retweets, quotes, bookmarks, impressions}.
+    Defaults all to 0 if public_metrics is missing (handles protected/edge cases
+    per adversarial review #2 KeyError gap)."""
+    m = tw.get("public_metrics") or {}
+    return {
+        "likes": int(m.get("like_count", 0) or 0),
+        "replies": int(m.get("reply_count", 0) or 0),
+        "retweets": int(m.get("retweet_count", 0) or 0),
+        "quotes": int(m.get("quote_count", 0) or 0),
+        "bookmarks": int(m.get("bookmark_count", 0) or 0),
+        "impressions": int(m.get("impression_count", 0) or 0),
+    }
+
+
+def engagement_score(tw: dict) -> int:
+    m = tweet_metrics(tw)
+    return m["likes"] + m["replies"] + m["retweets"] + m["quotes"]
+
+
+def tweet_mentions(tw: dict) -> list[str]:
+    """Return mentioned user_ids from the entities block (numeric strings)."""
+    out: list[str] = []
+    for u in (tw.get("entities") or {}).get("mentions") or []:
+        uid = u.get("id")
+        if uid:
+            out.append(str(uid))
+    return out
+
+
+# ─── Signal filter ────────────────────────────────────────────────────────────
+
+
+def extract_matched_keywords(text: str) -> list[str]:
+    """Return the THESIS_KEYWORDS that match. Lowercased canonical form."""
+    out: list[str] = []
+    for kw, pat in _KW_PATTERNS:
+        if pat.search(text):
+            out.append(kw)
+    return out
+
+
+@dataclasses.dataclass
+class AuthorBaseline:
+    n: int
+    median: float
+    iqr: float  # inter-quartile range (q3 - q1). 1.349 ≈ IQR/σ for normal.
+
+    def robust_z(self, x: float) -> float:
+        if self.iqr <= 0:
+            return 0.0
+        return (x - self.median) / (self.iqr / 1.349)
+
+
+def author_baseline_from_tweets(tweets: list[dict]) -> AuthorBaseline | None:
+    """Compute robust z-score baseline from this author's recent tweets.
+    Returns None if fewer than Z_SCORE_MIN_SAMPLES qualifying entries exist."""
+    samples: list[int] = []
+    for tw in tweets:
+        if tweet_is_retweet(tw):
+            continue  # exclude pure retweets — inherit halo, distort baseline
+        m = tweet_metrics(tw)
+        samples.append(m["likes"])
+    if len(samples) < Z_SCORE_MIN_SAMPLES:
+        return None
+    samples.sort()
+    n = len(samples)
+    median = statistics.median(samples)
+    q1 = samples[n // 4]
+    q3 = samples[(3 * n) // 4]
+    iqr = float(q3 - q1)
+    return AuthorBaseline(n=n, median=float(median), iqr=iqr)
+
+
+def passes_engagement_gate(
+    tw: dict,
+    acct: WatchAccount,
+    baseline: AuthorBaseline | None,
+) -> tuple[bool, str]:
+    """Returns (passes, reason). Reason recorded in signal frontmatter."""
+    if acct.tier == 1:
+        return True, "tier1-any"
+    m = tweet_metrics(tw)
+    if baseline:
+        z = baseline.robust_z(m["likes"])
+        if z >= Z_SCORE_THRESHOLD:
+            return True, f"zscore={z:.2f}"
+        return False, f"zscore={z:.2f}<{Z_SCORE_THRESHOLD}"
+    # Fallback: absolute thresholds.
+    likes_floor, replies_floor = ENGAGEMENT_FLOOR[acct.tier]
+    if likes_floor and m["likes"] >= likes_floor:
+        return True, f"likes={m['likes']}>={likes_floor}"
+    if replies_floor and m["replies"] >= replies_floor:
+        return True, f"replies={m['replies']}>={replies_floor}"
+    return False, f"abs-floor likes={m['likes']} replies={m['replies']}"
+
+
+def passes_signal_filter(
+    tw: dict,
+    acct: WatchAccount,
+    baseline: AuthorBaseline | None,
+    watchlist_user_ids: set[str],
+) -> tuple[bool, dict]:
+    """Decide whether this tweet becomes a signal page.
+
+    Pure retweets are always excluded. Otherwise:
+      - keyword match required
+      - AND (engagement gate passes OR is thread-starter T1 OR mentions another
+        watchlist account)
+    Returns (passes, reasons_dict).
+    """
+    if tweet_is_retweet(tw):
+        return False, {"skip": "retweet"}
+    text = tw.get("text") or ""
+    kws = extract_matched_keywords(text)
+    if not kws:
+        return False, {"skip": "no-keywords"}
+    eng_ok, eng_reason = passes_engagement_gate(tw, acct, baseline)
+    is_thread = (acct.tier == 1) and tweet_is_thread_starter(tw, acct.user_id)
+    mentions_watch = bool(set(tweet_mentions(tw)) & watchlist_user_ids)
+    if eng_ok or is_thread or mentions_watch:
+        return True, {
+            "keywords": kws,
+            "engagement_reason": eng_reason,
+            "thread_starter": is_thread,
+            "mentions_watchlist": mentions_watch,
+            "baseline_n": baseline.n if baseline else 0,
+        }
+    return False, {"skip": "engagement-gate", "engagement_reason": eng_reason,
+                   "keywords": kws}
+
+
+# ─── Narrative tracking ───────────────────────────────────────────────────────
+
+
+def iso_week(d: dt.date) -> str:
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def compute_rare_keywords(
+    week_posts: list[tuple[dict, list[str]]],
+) -> set[str]:
+    """Identify rare keywords within this week's matched posts.
+    Rare = appears in < RARE_KEYWORD_MAX_FREQ of matched posts."""
+    if not week_posts:
+        return set()
+    kw_counts: dict[str, int] = defaultdict(int)
+    for _tw, kws in week_posts:
+        for kw in set(kws):
+            kw_counts[kw] += 1
+    total = len(week_posts)
+    rare = {kw for kw, c in kw_counts.items() if c / total < RARE_KEYWORD_MAX_FREQ}
+    return rare
+
+
+def narrative_alert(
+    user_id: str,
+    week_posts_for_handle: list[tuple[dict, list[str]]],
+    rare_kws: set[str],
+) -> str | None:
+    """If 3+ posts share a (rare_kw, other_kw) pair, return that pair as the
+    topic label. Each qualifying post must contain BOTH keywords in the pair;
+    this avoids false positives where 3 posts only share the rare keyword but
+    differ on every other keyword (which would be "post drift," not narrative)."""
+    if len(week_posts_for_handle) < NARRATIVE_MIN_POSTS:
+        return None
+    pair_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for _tw, kws in week_posts_for_handle:
+        kwset = set(kws)
+        rare_in = kwset & rare_kws
+        other_in = kwset - rare_in
+        for rkw in rare_in:
+            for okw in other_in:
+                pair_counts[(rkw, okw)] += 1
+    qualifying = [(p, c) for p, c in pair_counts.items()
+                  if c >= NARRATIVE_MIN_POSTS]
+    if not qualifying:
+        return None
+    qualifying.sort(key=lambda kv: -kv[1])
+    rkw, okw = qualifying[0][0]
+    return f"{rkw} + {okw}"
+
+
+# ─── People page ──────────────────────────────────────────────────────────────
+
+
+_SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(name: str) -> str:
+    s = name.lower().strip()
+    s = _SLUG_NON_ALNUM.sub("-", s)
+    return s.strip("-")
+
+
+def find_existing_people_page(acct: WatchAccount) -> Path | None:
+    """Locate the existing brain people-page for this account. Match by:
+      1. exact slug match against acct.name
+      2. frontmatter `aliases:` list (containing handle or name)
+    Return None if not found (we do NOT auto-create — see adversarial #5 logic)."""
+    if not PEOPLE_DIR.is_dir():
+        return None
+    primary = PEOPLE_DIR / f"{slugify(acct.name)}.md"
+    if primary.is_file():
+        return primary
+    # Slow path: scan frontmatter aliases. Cheap on 460 files at startup.
+    handle_l = acct.handle.lower()
+    name_l = acct.name.lower()
+    for p in PEOPLE_DIR.glob("*.md"):
+        try:
+            with p.open("r") as f:
+                head = f.read(4096)
+        except OSError:
+            continue
+        if not head.startswith("---"):
+            continue
+        # Bounded frontmatter block.
+        end = head.find("\n---", 4)
+        if end < 0:
+            continue
+        fm_block = head[:end].lower()
+        # Match only against aliases or @handle, NOT raw substring of name.
+        if f"@{handle_l}" in fm_block:
+            return p
+        # aliases line: aliases: [foo, bar, baz]
+        m = re.search(r"^aliases:\s*\[([^\]]*)\]", fm_block, re.MULTILINE)
+        if m:
+            aliases = {a.strip().strip('"\'') for a in m.group(1).split(",")}
+            if handle_l in aliases or name_l in aliases:
+                return p
+    return None
+
+
+# ─── Brain page IO ────────────────────────────────────────────────────────────
+
+
+_YAML_RESERVED_LOWER = {"null", "true", "false", "yes", "no", "on", "off", "~"}
+_YAML_NUMERIC_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$|^0[xob][0-9a-fA-F]+$")
+
+
+def render_frontmatter(fm: dict[str, Any]) -> str:
+    out = ["---"]
+    for k, v in fm.items():
+        if isinstance(v, bool):
+            out.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            out.append(f"{k}: {v}")
+        elif isinstance(v, list):
+            out.append(f"{k}: [{', '.join(str(x) for x in v)}]")
+        elif v is None or v == "":
+            out.append(f"{k}: ")
+        else:
+            sv = str(v).replace("\n", " ").strip()
+            needs_quote = (
+                any(c in sv for c in ":#&*!|>%@`")
+                or sv.lower() in _YAML_RESERVED_LOWER
+                or _YAML_NUMERIC_RE.match(sv) is not None
+            )
+            if needs_quote:
+                sv = '"' + sv.replace('"', '\\"') + '"'
+            out.append(f"{k}: {sv}")
+    out.append("---")
+    return "\n".join(out) + "\n"
+
+
+def write_signal_page_atomic(
+    path: Path,
+    fm: dict[str, Any],
+    body: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp.open("w") as f:
+            f.write(render_frontmatter(fm))
+            if not body.startswith("\n"):
+                f.write("\n")
+            f.write(body)
+            if not body.endswith("\n"):
+                f.write("\n")
+        tmp.replace(path)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise XWriteError(f"signal page write {path}: {e}")
+
+
+_TIMELINE_HEADING_RE = re.compile(r"^##\s+Timeline\b")
+
+
+def append_to_people_timeline(
+    path: Path,
+    line: str,
+) -> None:
+    """Idempotent append to the ## Timeline section. Creates section if missing.
+    Recognises headings with trailing text (e.g., "## Timeline (last 30d)").
+    Skips matches inside fenced code blocks. If timeline marker is in content
+    but no real heading line found, falls back to appending a new section."""
+    try:
+        content = path.read_text()
+    except OSError as e:
+        raise XWriteError(f"people-page read {path}: {e}")
+    if line.strip() in content:
+        return  # idempotent — already present
+
+    lines = content.splitlines(keepends=True)
+    out: list[str] = []
+    inserted = False
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        s = lines[i]
+        out.append(s)
+        # Track triple-backtick fence state.
+        if s.lstrip().startswith("```"):
+            in_fence = not in_fence
+            i += 1
+            continue
+        if not inserted and not in_fence and _TIMELINE_HEADING_RE.match(s):
+            j = i + 1
+            while j < len(lines) and (lines[j].startswith("- ") or lines[j].strip() == ""):
+                out.append(lines[j])
+                j += 1
+            if out and not out[-1].endswith("\n"):
+                out[-1] += "\n"
+            out.append(line + "\n")
+            inserted = True
+            i = j
+            continue
+        i += 1
+
+    if not inserted:
+        # No real ## Timeline heading found (or all matches were in code fences).
+        # Append a fresh section.
+        joined = "".join(out)
+        sep = "" if joined.endswith("\n\n") else ("\n" if joined.endswith("\n") else "\n\n")
+        new_content = joined + sep + "## Timeline\n\n" + line + "\n"
+    else:
+        new_content = "".join(out)
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(new_content)
+        tmp.replace(path)
+    except OSError as e:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise XWriteError(f"people-page write {path}: {e}")
+
+
+def enqueue_reconcile(record: dict) -> None:
+    """When the two-write pattern's second step fails, drop a reconciliation
+    file so the next run can retry the people-page append."""
+    RECONCILE_DIR.mkdir(parents=True, exist_ok=True)
+    fname = f"{record.get('user_id','unknown')}-{record.get('post_id','?')}.json"
+    path = RECONCILE_DIR / fname
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, indent=2) + "\n")
+    tmp.replace(path)
+
+
+# ─── X API wrappers ───────────────────────────────────────────────────────────
+
+
+def fetch_user_tweets(
+    user_id: str,
+    token: str,
+    *,
+    since_dt: dt.datetime | None,
+    budget: ReadBudget,
+    wall: WallClock,
+    hard_cap: int = PER_HANDLE_HARD_CAP,
+) -> list[dict]:
+    """Pull recent tweets from one user. Returns list of tweet dicts ordered
+    newest-first. `since_dt` filters server-side via start_time."""
+    params = {
+        "max_results": PAGE_SIZE,
+        "tweet.fields": "created_at,public_metrics,referenced_tweets,in_reply_to_user_id,entities,conversation_id,author_id,lang",
+        "exclude": "retweets",  # exclude pure RTs server-side
+    }
+    if since_dt:
+        params["start_time"] = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    out: list[dict] = []
+    for tw, _users in x_paged(f"/users/{user_id}/tweets", token, params,
+                              budget=budget, wall=wall):
+        out.append(tw)
+        if len(out) >= hard_cap:
+            info(f"  user {user_id}: hit hard cap {hard_cap}, stopping")
+            return out
+    return out
+
+
+def fetch_list_tweets(
+    list_id: str,
+    token: str,
+    *,
+    since_id: str | None,
+    budget: ReadBudget,
+    wall: WallClock,
+    hard_cap: int = 1000,
+) -> list[tuple[dict, str]]:
+    """Pull recent tweets from a list. Returns [(tweet, author_id), ...].
+    `since_id` filters client-side (list endpoint doesn't accept since_id).
+    IDs compared as ints — Twitter snowflakes aren't lexically sortable across
+    length boundaries (e.g., "999..."(19) > "1000..."(20) lexically but not
+    numerically)."""
+    params = {
+        "max_results": PAGE_SIZE,
+        "tweet.fields": "created_at,public_metrics,referenced_tweets,in_reply_to_user_id,entities,conversation_id,author_id,lang",
+        "expansions": "author_id",
+    }
+    since_int = int(since_id) if since_id else None
+    out: list[tuple[dict, str]] = []
+    for tw, _users in x_paged(f"/lists/{list_id}/tweets", token, params,
+                              budget=budget, wall=wall):
+        author_id = str(tw.get("author_id") or "")
+        if since_int is not None and tw.get("id") and int(tw["id"]) <= since_int:
+            return out
+        out.append((tw, author_id))
+        if len(out) >= hard_cap:
+            return out
+    return out
+
+
+def list_create(token: str, name: str, description: str = "") -> str:
+    """Create a private list and return its id."""
+    status, data = x_request("POST", "/lists", token,
+                             body={"name": name, "description": description,
+                                   "private": True})
+    lid = ((data.get("data") or {}).get("id"))
+    if not lid:
+        raise XServerError(f"list_create: unexpected response: {data}")
+    return str(lid)
+
+
+def list_add_member(token: str, list_id: str, user_id: str) -> None:
+    x_request("POST", f"/lists/{list_id}/members", token,
+              body={"user_id": str(user_id)})
+
+
+def list_remove_member(token: str, list_id: str, user_id: str) -> None:
+    x_request("DELETE", f"/lists/{list_id}/members/{user_id}", token)
+
+
+def list_members(token: str, list_id: str, *, budget: ReadBudget,
+                 wall: WallClock) -> dict[str, dict]:
+    """Return {user_id: user_obj} for all current List members."""
+    out: dict[str, dict] = {}
+    pagination: str | None = None
+    while True:
+        params = {"max_results": 100, "user.fields": "username"}
+        if pagination:
+            params["pagination_token"] = pagination
+        _status, data = x_request("GET", f"/lists/{list_id}/members", token,
+                                  params=params, budget=budget, wall=wall)
+        for u in (data.get("data") or []):
+            uid = str(u.get("id"))
+            if uid:
+                out[uid] = u
+        meta = data.get("meta") or {}
+        pagination = meta.get("next_token")
+        if not pagination:
+            return out
+
+
+# ─── Setup: create the private List ──────────────────────────────────────────
+
+
+def cmd_setup(wl: Watchlist, token: str, *, dry_run: bool) -> None:
+    if wl.list_id:
+        info(f"list_id already set: {wl.list_id}; skipping create.")
+        return
+    name = "erv-electrification-watchlist"
+    desc = "Private List for x-ingest. Auto-managed; edit ~/bin/config/x-watchlist.json."
+    if dry_run:
+        info(f"[dry-run] would create private list {name!r} with {len(wl.accounts)} members")
+        return
+    list_id = list_create(token, name, desc)
+    info(f"created private list: {list_id}")
+    # Save list_id BEFORE adding members. If credits deplete mid-add, the
+    # auto-reconcile path on the next run will retry the missing adds against
+    # this same list — no orphan-list created.
+    save_watchlist_list_id(wl, list_id)
+    info(f"wrote list_id back to {CONFIG_PATH}")
+    for acct in wl.accounts:
+        try:
+            list_add_member(token, list_id, acct.user_id)
+            info(f"  + @{acct.handle} ({acct.user_id})")
+        except XServerError as e:
+            info(f"  ! @{acct.handle}: {e}")
+
+
+LIST_ADD_RETRY_COOLDOWN_DAYS = 7
+
+
+def reconcile_list(wl: Watchlist, token: str, state: dict, *,
+                   budget: ReadBudget, wall: WallClock,
+                   fix: bool) -> tuple[set[str], set[str]]:
+    """Diff list members vs watchlist.
+
+    Returns (extra_in_list, missing_from_list). If `fix=True`, the diff is
+    applied: extras are removed from the List, missing are added.
+
+    Failed list_add_member calls are tracked in state.list_add_failures and
+    skipped for LIST_ADD_RETRY_COOLDOWN_DAYS to avoid retrying dead/suspended
+    accounts on every run.
+    """
+    if not wl.list_id:
+        return set(), set()
+    members = list_members(token, wl.list_id, budget=budget, wall=wall)
+    want_ids = {a.user_id for a in wl.accounts}
+    have_ids = set(members.keys())
+    extras = have_ids - want_ids
+    missing = want_ids - have_ids
+    if extras or missing:
+        info(f"  list reconcile: +{len(missing)} missing, -{len(extras)} extras")
+    if fix:
+        failures: dict[str, dict] = state.get("list_add_failures") or {}
+        today = dt.date.today()
+        cooldown = dt.timedelta(days=LIST_ADD_RETRY_COOLDOWN_DAYS)
+        for uid in extras:
+            try:
+                list_remove_member(token, wl.list_id, uid)
+                info(f"  -list @{members[uid].get('username', uid)}")
+            except XServerError as e:
+                info(f"  ! list remove {uid}: {e}")
+        for uid in missing:
+            prev = failures.get(uid)
+            if prev:
+                try:
+                    last_try = dt.date.fromisoformat(prev["tried_at"][:10])
+                    if today - last_try < cooldown:
+                        info(f"  ~list {uid}: in cooldown ({prev['last_err'][:60]})")
+                        continue
+                except (KeyError, ValueError):
+                    pass
+            try:
+                list_add_member(token, wl.list_id, uid)
+                info(f"  +list {uid}")
+                failures.pop(uid, None)
+            except XServerError as e:
+                info(f"  ! list add {uid}: {e}")
+                failures[uid] = {"last_err": str(e)[:300], "tried_at": now_iso()}
+        state["list_add_failures"] = failures
+    return extras, missing
+
+
+# ─── Signal page rendering ────────────────────────────────────────────────────
+
+
+def signal_page_path(handle: str, post_id: str, created_at: dt.datetime) -> Path:
+    return SIGNALS_DIR / created_at.strftime("%Y-%m") / f"{handle}-{post_id}.md"
+
+
+def render_signal_page(
+    tw: dict,
+    acct: WatchAccount,
+    filter_meta: dict,
+    metrics: dict[str, int],
+) -> tuple[dict, str]:
+    """Returns (frontmatter, body) for a signal page."""
+    post_id = str(tw.get("id"))
+    created_at_iso = tw.get("created_at") or now_iso()
+    text = scrub_content(tw.get("text") or "")[:SIGNAL_BODY_CAP_BYTES]
+
+    fm = {
+        "type": "signal",
+        "source": "x",
+        "handle": acct.handle,
+        "user_id": acct.user_id,
+        "post_id": post_id,
+        "date": created_at_iso[:10],
+        "tier": acct.tier,
+        "engagement": metrics["likes"] + metrics["replies"] + metrics["retweets"] + metrics["quotes"],
+        "likes": metrics["likes"],
+        "replies": metrics["replies"],
+        "retweets": metrics["retweets"],
+        "quotes": metrics["quotes"],
+        "thesis_relevance": filter_meta.get("keywords") or [],
+        "engagement_reason": filter_meta.get("engagement_reason", ""),
+        "thread_starter": bool(filter_meta.get("thread_starter")),
+        "mentions_watchlist": bool(filter_meta.get("mentions_watchlist")),
+        "ingested": today_iso(),
+    }
+    body_lines = [
+        f"# @{acct.handle} on X — {created_at_iso[:10]}",
+        "",
+        text,
+        "",
+        f"[Source: [x.com/{acct.handle}/status/{post_id}](https://x.com/{acct.handle}/status/{post_id}) {created_at_iso[:10]}]",
+    ]
+    return fm, "\n".join(body_lines)
+
+
+def render_people_timeline_line(
+    tw: dict,
+    acct: WatchAccount,
+) -> str:
+    """Format per spec: bolded date + 100-char preview + citation."""
+    post_id = str(tw.get("id"))
+    created = (tw.get("created_at") or now_iso())[:10]
+    text = scrub_content(tw.get("text") or "").replace("\n", " ").strip()
+    preview = text[:100] + ("..." if len(text) > 100 else "")
+    return (f"- **{created}** | Posted on X: \"{preview}\" "
+            f"[Source: [x.com/{acct.handle}/status/{post_id}]"
+            f"(https://x.com/{acct.handle}/status/{post_id}) {created}]")
+
+
+# ─── Two-write transactional ──────────────────────────────────────────────────
+
+
+def two_write(
+    tw: dict,
+    acct: WatchAccount,
+    filter_meta: dict,
+    *,
+    dry_run: bool = False,
+) -> tuple[bool, str]:
+    """Write signal page + append to people timeline atomically.
+
+    Returns (committed, status). Committed=True means cursor may advance.
+    Failed people-write enqueues to reconcile but still counts as committed
+    (signal page is on disk; we don't want to re-fetch and re-write the same
+    signal page on every retry).
+    """
+    metrics = tweet_metrics(tw)
+    fm, body = render_signal_page(tw, acct, filter_meta, metrics)
+    try:
+        created = parse_iso(tw.get("created_at") or now_iso())
+    except ValueError:
+        created = dt.datetime.now(dt.timezone.utc)
+    sig_path = signal_page_path(acct.handle, str(tw.get("id")), created)
+    if dry_run:
+        info(f"  [dry-run] would write {sig_path.relative_to(BRAIN)}")
+        return True, "dry-run"
+
+    if not sig_path.is_file():
+        write_signal_page_atomic(sig_path, fm, body)
+
+    # People-page append. ALWAYS attempted, even when signal page already
+    # exists — append_to_people_timeline is idempotent (line-level dedup), so
+    # this self-heals crash-between-writes where a prior run wrote the signal
+    # but failed before completing the timeline append.
+    people_path = find_existing_people_page(acct)
+    if people_path:
+        timeline_line = render_people_timeline_line(tw, acct)
+        try:
+            append_to_people_timeline(people_path, timeline_line)
+            return True, "signal+timeline"
+        except XWriteError as e:
+            enqueue_reconcile({
+                "user_id": acct.user_id,
+                "handle": acct.handle,
+                "post_id": str(tw.get("id")),
+                "people_path": str(people_path),
+                "timeline_line": timeline_line,
+                "error": str(e),
+                "queued_at": now_iso(),
+            })
+            return True, f"signal-only-reconcile-queued ({e})"
+    else:
+        return True, "signal-only-no-people-page"
+
+
+# ─── Backfill ─────────────────────────────────────────────────────────────────
+
+
+def cmd_backfill(
+    wl: Watchlist,
+    token: str,
+    state: dict,
+    *,
+    budget: ReadBudget,
+    wall: WallClock,
+    dry_run: bool,
+    limit: int | None,
+    tier_filter: int | None,
+) -> dict:
+    """Run per-handle backfill across the watchlist. Resumes from per_handle_cursor."""
+    watchlist_uids = {a.user_id for a in wl.accounts}
+    stats = {
+        "fetched": 0, "signals": 0, "skipped": 0, "errors": 0,
+        "narratives": 0, "handles_done": 0,
+    }
+    stdout_contract(f"RUN_START:{now_iso()}:mode=backfill")
+    narrative_buckets: dict[str, list[tuple[dict, list[str]]]] = defaultdict(list)
+
+    for acct in wl.accounts:
+        if tier_filter and acct.tier != tier_filter:
+            continue
+        if state["per_handle_done"].get(acct.user_id) and not dry_run:
+            info(f"@{acct.handle}: already complete, skip")
+            continue
+        days = BACKFILL_DAYS[acct.tier]
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+        info(f"@{acct.handle} (T{acct.tier}): backfill {days}d since {since.date()}")
+        try:
+            tweets = fetch_user_tweets(acct.user_id, token, since_dt=since,
+                                       budget=budget, wall=wall,
+                                       hard_cap=hard_cap_for_tier(acct.tier))
+        except XCreditsDepletedError:
+            raise
+        except XRateLimitError as e:
+            info(f"  rate-limited; saving state and exiting: {e}")
+            break
+        except XServerError as e:
+            info(f"  @{acct.handle}: {e}; skipping")
+            stats["errors"] += 1
+            continue
+        stats["fetched"] += len(tweets)
+        baseline = author_baseline_from_tweets(tweets)
+        info(f"  fetched {len(tweets)} tweets; baseline n={(baseline.n if baseline else 0)}")
+
+        # Track newest tweet seen so delta-after-backfill knows where to resume.
+        newest_int: int | None = None
+        newest_id: str | None = None
+        for tw in tweets:
+            tid = str(tw.get("id"))
+            try:
+                tid_int = int(tid)
+            except ValueError:
+                tid_int = None
+            if tid_int is not None and (newest_int is None or tid_int > newest_int):
+                newest_int = tid_int
+                newest_id = tid
+            ok, meta = passes_signal_filter(tw, acct, baseline, watchlist_uids)
+            if not ok:
+                stats["skipped"] += 1
+                continue
+            committed, status = two_write(tw, acct, meta, dry_run=dry_run)
+            if committed:
+                stats["signals"] += 1
+                kws = meta.get("keywords") or []
+                narrative_buckets[acct.user_id].append((tw, kws))
+            if limit and stats["signals"] >= limit:
+                info(f"  hit --limit {limit}, stopping backfill")
+                if newest_id and not dry_run:
+                    state["per_handle_cursor"][acct.user_id] = newest_id
+                _maybe_finalize(stats, state, narrative_buckets, dry_run)
+                return stats
+        if newest_id and not dry_run:
+            state["per_handle_cursor"][acct.user_id] = newest_id
+        state["per_handle_done"][acct.user_id] = True
+        stats["handles_done"] += 1
+        stdout_contract(f"HANDLE_DONE:{acct.handle}:fetched={len(tweets)}:signals={stats['signals']}")
+
+    # backfill_complete reflects WHOLE watchlist coverage, not just the
+    # filtered tier. A --tier 1 run that completes T1 must not flip the flag
+    # while T2/T3 remain un-baselined.
+    if all(state["per_handle_done"].get(a.user_id) for a in wl.accounts):
+        state["backfill_complete"] = True
+
+    _maybe_finalize(stats, state, narrative_buckets, dry_run)
+    return stats
+
+
+def _maybe_finalize(
+    stats: dict,
+    state: dict,
+    narrative_buckets: dict[str, list[tuple[dict, list[str]]]],
+    dry_run: bool,
+) -> None:
+    """Compute narrative alerts and update state. Rare-keyword frequency is
+    computed across ALL handles' weekly posts (cross-handle denominator) so
+    that "rare" reflects watchlist-wide novelty, not single-handle novelty."""
+    all_posts: list[tuple[dict, list[str]]] = []
+    for posts in narrative_buckets.values():
+        all_posts.extend(posts)
+    rare = compute_rare_keywords(all_posts)
+    for uid, week_posts in narrative_buckets.items():
+        topic = narrative_alert(uid, week_posts, rare)
+        if topic:
+            stats["narratives"] += 1
+            stdout_contract(f"NARRATIVE_ALERT:user_id={uid}:topic={topic}:count={len(week_posts)}")
+            if not dry_run:
+                _annotate_narrative(uid, topic, len(week_posts), state)
+    state["last_run_at"] = now_iso()
+    state["reads_total"] = state.get("reads_total", 0) + stats["fetched"]
+
+
+def _annotate_narrative(uid: str, topic: str, count: int, state: dict) -> None:
+    """Track narrative annotations in state with 90d TTL."""
+    entries = state["narrative_counters"].setdefault(uid, [])
+    expires = (dt.datetime.now(dt.timezone.utc)
+               + dt.timedelta(days=NARRATIVE_ANNOTATION_TTL_DAYS)).strftime("%Y-%m-%d")
+    entries.append({
+        "topic": topic, "count": count, "detected": today_iso(),
+        "expires": expires,
+    })
+
+
+def cleanup_expired_narratives(state: dict) -> int:
+    """Drop narrative annotations past their TTL. Returns count removed."""
+    removed = 0
+    today = today_iso()
+    for uid, entries in list(state["narrative_counters"].items()):
+        kept = [e for e in entries if e.get("expires", "") >= today]
+        removed += len(entries) - len(kept)
+        if kept:
+            state["narrative_counters"][uid] = kept
+        else:
+            del state["narrative_counters"][uid]
+    return removed
+
+
+# ─── Delta sync ───────────────────────────────────────────────────────────────
+
+
+def cmd_delta(
+    wl: Watchlist,
+    token: str,
+    state: dict,
+    *,
+    budget: ReadBudget,
+    wall: WallClock,
+    dry_run: bool,
+    limit: int | None,
+) -> dict:
+    """Weekly delta: pull recent tweets from the X List; per-handle fallback."""
+    if not state.get("backfill_complete"):
+        info("WARN: backfill not complete; delta may be sparse on un-baselined accounts.")
+    watchlist_uids = {a.user_id for a in wl.accounts}
+    by_uid = wl.by_user_id()
+    stats = {"fetched": 0, "signals": 0, "skipped": 0, "errors": 0, "narratives": 0}
+    stdout_contract(f"RUN_START:{now_iso()}:mode=delta")
+
+    narrative_buckets: dict[str, list[tuple[dict, list[str]]]] = defaultdict(list)
+
+    use_list = bool(wl.list_id)
+    list_failed = False
+    if use_list:
+        try:
+            info(f"delta via list {wl.list_id} (since_id={state.get('list_cursor')})")
+            results = fetch_list_tweets(wl.list_id, token,
+                                        since_id=state.get("list_cursor"),
+                                        budget=budget, wall=wall)
+            stats["fetched"] = len(results)
+            # Snowflake IDs compared as ints (lex compare breaks across
+            # length boundaries).
+            max_id = state.get("list_cursor")
+            max_id_int = int(max_id) if max_id else None
+            for tw, author_id in results:
+                tid = str(tw.get("id"))
+                tid_int = int(tid)
+                if max_id_int is None or tid_int > max_id_int:
+                    max_id = tid
+                    max_id_int = tid_int
+                acct = by_uid.get(author_id)
+                if not acct:
+                    # Author not in our watchlist (e.g., list contains extras).
+                    stats["skipped"] += 1
+                    continue
+                ok, meta = passes_signal_filter(tw, acct, None, watchlist_uids)
+                # No baseline available in delta mode unless we maintain one.
+                # (Per design: baselines computed during backfill; in delta we
+                # use absolute thresholds.)
+                if not ok:
+                    stats["skipped"] += 1
+                    continue
+                committed, status = two_write(tw, acct, meta, dry_run=dry_run)
+                if committed:
+                    stats["signals"] += 1
+                    kws = meta.get("keywords") or []
+                    narrative_buckets[acct.user_id].append((tw, kws))
+                if limit and stats["signals"] >= limit:
+                    break
+            if max_id:
+                state["list_cursor"] = max_id
+        except XServerError as e:
+            info(f"list endpoint failed: {e}; falling back to per-handle delta")
+            list_failed = True
+        except XRateLimitError as e:
+            info(f"rate-limited on list endpoint: {e}; saving state and exiting")
+            list_failed = True
+
+    if not use_list or list_failed:
+        # Per-handle delta: only fetch tweets newer than per_handle_cursor.
+        for acct in wl.accounts:
+            cursor_id = state["per_handle_cursor"].get(acct.user_id)
+            since = None
+            if not cursor_id:
+                # First delta after backfill — only pull last 3 days to bridge gap.
+                since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=3)
+            try:
+                tweets = fetch_user_tweets(acct.user_id, token, since_dt=since,
+                                           budget=budget, wall=wall)
+            except XCreditsDepletedError:
+                raise
+            except XServerError as e:
+                stats["errors"] += 1
+                info(f"  @{acct.handle}: {e}; skip")
+                continue
+            stats["fetched"] += len(tweets)
+            new_cursor = cursor_id
+            cursor_int = int(cursor_id) if cursor_id else None
+            new_cursor_int = cursor_int
+            for tw in tweets:
+                tid = str(tw.get("id"))
+                tid_int = int(tid)
+                if cursor_int is not None and tid_int <= cursor_int:
+                    continue
+                if new_cursor_int is None or tid_int > new_cursor_int:
+                    new_cursor = tid
+                    new_cursor_int = tid_int
+                ok, meta = passes_signal_filter(tw, acct, None, watchlist_uids)
+                if not ok:
+                    stats["skipped"] += 1
+                    continue
+                committed, _ = two_write(tw, acct, meta, dry_run=dry_run)
+                if committed:
+                    stats["signals"] += 1
+                    kws = meta.get("keywords") or []
+                    narrative_buckets[acct.user_id].append((tw, kws))
+            if new_cursor:
+                state["per_handle_cursor"][acct.user_id] = new_cursor
+            stdout_contract(f"HANDLE_DONE:{acct.handle}:fetched={len(tweets)}")
+
+    _maybe_finalize(stats, state, narrative_buckets, dry_run)
+    return stats
+
+
+# ─── Stats mode (estimate without ingesting) ──────────────────────────────────
+
+
+def cmd_stats(wl: Watchlist, token: str, *, budget: ReadBudget,
+              wall: WallClock) -> None:
+    """Estimate backfill volume per handle without writing anything."""
+    info("Estimating backfill volume per handle (one fetch per account)...")
+    grand_total = 0
+    by_tier: dict[int, int] = defaultdict(int)
+    for acct in wl.accounts:
+        days = BACKFILL_DAYS[acct.tier]
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+        try:
+            tweets = fetch_user_tweets(acct.user_id, token, since_dt=since,
+                                       budget=budget, wall=wall,
+                                       hard_cap=hard_cap_for_tier(acct.tier))
+        except XServerError as e:
+            info(f"  @{acct.handle}: {e}")
+            continue
+        watchlist_uids = {a.user_id for a in wl.accounts}
+        baseline = author_baseline_from_tweets(tweets)
+        signals = 0
+        for tw in tweets:
+            ok, _ = passes_signal_filter(tw, acct, baseline, watchlist_uids)
+            if ok:
+                signals += 1
+        info(f"  @{acct.handle} (T{acct.tier}, {days}d): {len(tweets)} fetched, "
+             f"{signals} pass filter, baseline_n={baseline.n if baseline else 0}")
+        grand_total += signals
+        by_tier[acct.tier] += signals
+    info(f"\nESTIMATE: {grand_total} signal pages total")
+    for t in (1, 2, 3):
+        info(f"  Tier {t}: {by_tier[t]} signals")
+    info(f"  API reads consumed (estimate): {budget.used}")
+
+
+# ─── Index regeneration ───────────────────────────────────────────────────────
+
+
+def regenerate_signal_index(
+    wl: Watchlist,
+    state: dict,
+    *,
+    partial: bool,
+) -> Path:
+    """Rebuild ~/brain/concepts/x-signal-index.md.
+
+    If partial=True (backfill not complete), writes to x-signal-index-partial.md
+    with a banner.
+    """
+    CONCEPTS_DIR.mkdir(parents=True, exist_ok=True)
+    name = "x-signal-index-partial.md" if partial else "x-signal-index.md"
+    path = CONCEPTS_DIR / name
+    now = dt.datetime.now(dt.timezone.utc)
+    week_ago = now - dt.timedelta(days=7)
+
+    handle_counts: dict[str, int] = defaultdict(int)
+    handle_topics: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    handle_latest: dict[str, str] = {}
+    total_week = 0
+
+    if SIGNALS_DIR.is_dir():
+        for sub in SIGNALS_DIR.iterdir():
+            if not sub.is_dir():
+                continue
+            for p in sub.glob("*.md"):
+                try:
+                    with p.open("r") as f:
+                        head = f.read(2048)
+                except OSError:
+                    continue
+                m = re.search(r"^date:\s*(\d{4}-\d{2}-\d{2})", head, re.MULTILINE)
+                if not m:
+                    continue
+                try:
+                    d = dt.datetime.fromisoformat(m.group(1)).replace(tzinfo=dt.timezone.utc)
+                except ValueError:
+                    continue
+                if d < week_ago:
+                    continue
+                handle_m = re.search(r"^handle:\s*(\S+)", head, re.MULTILINE)
+                if not handle_m:
+                    continue
+                handle = handle_m.group(1)
+                handle_counts[handle] += 1
+                total_week += 1
+                if (handle not in handle_latest) or (m.group(1) > handle_latest[handle]):
+                    handle_latest[handle] = m.group(1)
+                kw_m = re.search(r"thesis_relevance:\s*\[([^\]]*)\]", head)
+                if kw_m:
+                    for kw in [s.strip() for s in kw_m.group(1).split(",") if s.strip()]:
+                        handle_topics[handle][kw] += 1
+
+    by_uid = wl.by_user_id()
+    handle_to_tier: dict[str, int] = {a.handle: a.tier for a in wl.accounts}
+
+    out = ["# X Signal Index", ""]
+    if partial:
+        out += ["> **STILL BACKFILLING** — this is a partial index. The full index"
+                " regenerates after backfill completes.", ""]
+    out += [f"Last synced: {now.strftime('%Y-%m-%d %H:%M')} UTC", ""]
+    out += ["## Most active this week (by thesis-relevant post count)", ""]
+    out += ["| Handle | Tier | Posts | Top topic | Latest |",
+            "|---|---|---|---|---|"]
+    for handle, count in sorted(handle_counts.items(), key=lambda kv: -kv[1])[:15]:
+        tops = handle_topics[handle]
+        top_kw = max(tops.items(), key=lambda kv: kv[1])[0] if tops else "—"
+        out.append(f"| [[@{handle}]] | T{handle_to_tier.get(handle, '?')} | "
+                   f"{count} | {top_kw} | {handle_latest.get(handle, '—')} |")
+    out += ["", "## Narrative alerts (3+ posts on same topic, 7d)", ""]
+    any_alert = False
+    for uid, entries in (state.get("narrative_counters") or {}).items():
+        acct = by_uid.get(uid)
+        if not acct:
+            continue
+        for e in entries:
+            if e.get("expires", "") < today_iso():
+                continue
+            any_alert = True
+            out.append(f"- **@{acct.handle}** (T{acct.tier}): {e.get('count','?')}"
+                       f" posts on `{e.get('topic','?')}` (detected {e.get('detected','?')},"
+                       f" expires {e.get('expires','?')})")
+    if not any_alert:
+        out.append("_no active narrative alerts_")
+    out += ["", "## Watchlist coverage", ""]
+    tcounts = defaultdict(int)
+    for h in handle_counts:
+        tcounts[handle_to_tier.get(h, "?")] += 1
+    for t in (1, 2, 3):
+        accs = [a for a in wl.accounts if a.tier == t]
+        out.append(f"- Tier {t}: {tcounts[t]} of {len(accs)} accounts posted; "
+                   f"{sum(handle_counts[a.handle] for a in accs)} signals this week")
+    out += ["", "## Total signals this week", "", f"{total_week}", ""]
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(out))
+    tmp.replace(path)
+    return path
+
+
+# ─── Heartbeat + run summary ──────────────────────────────────────────────────
+
+
+def write_heartbeat(event: str, status: str, **details: Any) -> None:
+    INTEGRATION_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"ts": now_iso(), "event": event, "source_version": "0.1",
+           "status": status, "details": details}
+    try:
+        with HEARTBEAT_PATH.open("a") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except OSError:
+        pass
+
+
+def write_run_summary(mode: str, stats: dict, state: dict, started_at: str,
+                      ended_at: str, reads_used: int,
+                      reconcile_q_size: int) -> Path:
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    fname = f"x-run-{dt.datetime.now().strftime('%Y-%m-%d-%H%M')}.md"
+    path = TASKS_DIR / fname
+    lines = [
+        f"# x-ingest run — {mode}",
+        "",
+        f"- started: {started_at}",
+        f"- ended: {ended_at}",
+        f"- reads_used: {reads_used}",
+        f"- backfill_complete: {state.get('backfill_complete')}",
+        f"- signals_total_run: {stats.get('signals', 0)}",
+        f"- fetched_total_run: {stats.get('fetched', 0)}",
+        f"- skipped_total_run: {stats.get('skipped', 0)}",
+        f"- errors: {stats.get('errors', 0)}",
+        f"- narratives_detected: {stats.get('narratives', 0)}",
+        f"- reconcile_queue_size: {reconcile_q_size}",
+        "",
+    ]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines))
+    tmp.replace(path)
+    return path
+
+
+def reconcile_queue_size() -> int:
+    if not RECONCILE_DIR.is_dir():
+        return 0
+    return len(list(RECONCILE_DIR.glob("*.json")))
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="x-ingest — X watchlist to brain signal collector")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--backfill", action="store_true", help="Per-handle tiered-window backfill")
+    mode.add_argument("--delta", action="store_true", help="Default: list-based delta sync")
+    mode.add_argument("--setup", action="store_true", help="Create the private X List")
+    mode.add_argument("--stats", action="store_true", help="Estimate volume; no writes")
+    mode.add_argument("--reconcile-list", action="store_true",
+                      help="Diff List vs watchlist and apply fixes")
+    p.add_argument("--dry-run", action="store_true", help="No writes, no state changes")
+    p.add_argument("--limit", type=int, default=None, help="Stop after N signals written")
+    p.add_argument("--tier", type=int, choices=[1, 2, 3], default=None,
+                   help="Backfill only one tier")
+    p.add_argument("--max-reads", type=int, default=DEFAULT_MAX_READS,
+                   help=f"API read budget (default {DEFAULT_MAX_READS})")
+    p.add_argument("--no-index", action="store_true", help="Skip index regeneration")
+    args = p.parse_args(argv)
+
+    started_at = now_iso()
+    info(f"x-ingest start: {started_at}")
+
+    try:
+        wl = load_watchlist()
+    except XConfigError as e:
+        info(f"FATAL: {e}")
+        write_heartbeat("run", "config_error", error=str(e))
+        return 78
+
+    info(f"watchlist: {len(wl.accounts)} accounts, list_id={wl.list_id}")
+
+    try:
+        token = load_bearer_token()
+    except XAuthMissingError as e:
+        info(f"FATAL: {e}")
+        write_heartbeat("run", "auth_missing", error=str(e))
+        return 78
+
+    budget = ReadBudget(max_reads=args.max_reads)
+    wall = WallClock()
+
+    state = load_state()
+    n_expired = cleanup_expired_narratives(state)
+    if n_expired:
+        info(f"  expired {n_expired} narrative annotations")
+
+    try:
+        with acquire_lock():
+            if args.setup:
+                cmd_setup(wl, token, dry_run=args.dry_run)
+                write_heartbeat("setup", "ok", list_id=wl.list_id)
+                return 0
+
+            if args.reconcile_list:
+                extras, missing = reconcile_list(wl, token, state, budget=budget,
+                                                  wall=wall, fix=not args.dry_run)
+                info(f"reconcile: extras={len(extras)}, missing={len(missing)}")
+                return 0
+
+            if args.stats:
+                cmd_stats(wl, token, budget=budget, wall=wall)
+                return 0
+
+            # Auto-reconcile list (read-only check) on every real run.
+            if wl.list_id and not args.dry_run:
+                try:
+                    reconcile_list(wl, token, state, budget=budget, wall=wall, fix=True)
+                except XServerError as e:
+                    info(f"list reconcile warning: {e}")
+
+            if args.backfill:
+                stats = cmd_backfill(wl, token, state, budget=budget, wall=wall,
+                                     dry_run=args.dry_run, limit=args.limit,
+                                     tier_filter=args.tier)
+            else:
+                # Default: delta
+                stats = cmd_delta(wl, token, state, budget=budget, wall=wall,
+                                  dry_run=args.dry_run, limit=args.limit)
+
+            if not args.dry_run:
+                save_state_atomic(state)
+
+            if not args.no_index:
+                idx_path = regenerate_signal_index(
+                    wl, state, partial=not state.get("backfill_complete"))
+                info(f"signal index: {idx_path}")
+
+            ended_at = now_iso()
+            summary_path = write_run_summary(
+                "backfill" if args.backfill else "delta", stats, state,
+                started_at, ended_at, budget.used, reconcile_queue_size())
+            info(f"run summary: {summary_path}")
+            stdout_contract(
+                f"RUN_COMPLETE:{ended_at}:reads={budget.used}"
+                f":signals={stats.get('signals',0)}"
+                f":narratives={stats.get('narratives',0)}"
+            )
+            write_heartbeat("run", "ok", reads=budget.used,
+                            signals=stats.get('signals', 0),
+                            narratives=stats.get('narratives', 0),
+                            backfill_complete=state.get('backfill_complete'))
+            return 0
+
+    except XAuthError as e:
+        info(f"FATAL AUTH: {e}")
+        write_heartbeat("run", "auth_error", error=str(e))
+        return 78
+    except XCreditsDepletedError as e:
+        info(f"FATAL CREDITS: {e}")
+        write_heartbeat("run", "credits_depleted", error=str(e))
+        return 78
+    except XReadBudgetExhausted as e:
+        info(f"BUDGET EXHAUSTED: {e}")
+        write_heartbeat("run", "budget_exhausted", error=str(e))
+        # Still save state and return non-zero so cron knows partial.
+        try:
+            save_state_atomic(state)
+        except OSError:
+            pass
+        return 75
+    except XWallClockExceeded as e:
+        info(f"WALL CLOCK: {e}")
+        write_heartbeat("run", "wall_clock", error=str(e))
+        try:
+            save_state_atomic(state)
+        except OSError:
+            pass
+        return 75
+    except XLockHeldError as e:
+        info(f"LOCK: {e}")
+        return 75
+    except XConfigError as e:
+        info(f"CONFIG: {e}")
+        return 78
+
+
+if __name__ == "__main__":
+    sys.exit(main())
