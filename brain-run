@@ -440,21 +440,72 @@ phase_0_preflight() {
   fi
   log "   ${_C_GREEN}✓${_C_RESET} brain repo:   $BRAIN_DIR"
 
-  # Supervisor health (skipped in tests)
+  # Supervisor health (skipped in tests). Auto-starts in tmux if not running
+  # — ported from brain-eod on 2026-05-21 when brain-eod was retired.
   if [ "${BRAIN_RUN_SKIP_SUPERVISOR:-0}" = "1" ]; then
     log "   ${_C_DIM}↷ supervisor:  skipped (BRAIN_RUN_SKIP_SUPERVISOR=1)${_C_RESET}"
   else
-    # Best-effort; non-fatal if it can't report.
-    if "$GBRAIN_BIN" jobs supervisor status --json 2>/dev/null \
-        | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin).get('running') else 1)" 2>/dev/null; then
-      log "   ${_C_GREEN}✓${_C_RESET} supervisor:   running"
-    else
-      log "   ${_C_YELLOW}!${_C_RESET} supervisor:   not running (Phase 5 will fail if needed)"
-    fi
+    _ensure_supervisor
   fi
 
   log "   ${_C_GREEN}✓${_C_RESET} run dir:      $RUN_DIR"
   end_phase 0 succeeded
+}
+
+# Check supervisor health; if not running, start it in a tmux session so
+# Phase 5 (gbrain mechanical dream) has something to dispatch to. Non-fatal:
+# if tmux isn't installed or supervisor fails to come up, Phase 5 will skip
+# gracefully.
+#
+# Ported from brain-eod (lines 44-92 of the original) on 2026-05-21.
+_ensure_supervisor() {
+  local tmux_session="brain-supervisor"
+  local pid=""
+
+  _sup_running() {
+    "$GBRAIN_BIN" jobs supervisor status --json 2>/dev/null \
+      | python3 -c "import json,sys
+try:
+    d = json.load(sys.stdin)
+    sys.exit(0 if d.get('running') else 1)
+except Exception:
+    sys.exit(2)" 2>/dev/null
+  }
+
+  _sup_pid() {
+    "$GBRAIN_BIN" jobs supervisor status --json 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('supervisor_pid',''))" 2>/dev/null \
+      || echo ""
+  }
+
+  if _sup_running; then
+    pid=$(_sup_pid)
+    log "   ${_C_GREEN}✓${_C_RESET} supervisor:   running (pid $pid)"
+    return 0
+  fi
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    log "   ${_C_YELLOW}!${_C_RESET} supervisor:   not running (tmux missing; \`brew install tmux\`). Phase 5 will skip."
+    return 0
+  fi
+
+  if tmux has-session -t "$tmux_session" 2>/dev/null; then
+    log "   ${_C_DIM}▸${_C_RESET} stale tmux session '$tmux_session' — killing"
+    tmux kill-session -t "$tmux_session" 2>/dev/null || true
+  fi
+
+  log "   ${_C_DIM}▸${_C_RESET} starting supervisor in tmux session '$tmux_session'..."
+  tmux new-session -d -s "$tmux_session" \
+    "GBRAIN_ALLOW_SHELL_JOBS=1 $GBRAIN_BIN jobs supervisor start --allow-shell-jobs"
+  sleep 3
+
+  if _sup_running; then
+    pid=$(_sup_pid)
+    log "   ${_C_GREEN}✓${_C_RESET} supervisor:   started in tmux '$tmux_session' (pid $pid)"
+    log "   ${_C_DIM}ℹ${_C_RESET}              attach to watch: tmux attach -t $tmux_session"
+  else
+    log "   ${_C_YELLOW}!${_C_RESET} supervisor:   failed to start. Phase 5 will skip."
+  fi
 }
 
 # ─── Phase 1: Git safety ─────────────────────────────────────────────────────
