@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+gbrain-export-transcripts — convert Claude Code session .jsonl logs into clean
+.txt conversation transcripts for the gbrain dream-cycle synthesize phase.
+
+Why this exists:
+  The dream synthesize phase (src/core/cycle/transcript-discovery.ts) discovers
+  only *.txt / *.md files in session_corpus_dir. Claude Code stores sessions as
+  *.jsonl (structured events) plus tool-results/*.txt noise dumps. Pointing the
+  corpus at the raw projects dir therefore feeds synthesis tool-output noise and
+  ignores every real conversation. This exporter strips the noise (thinking /
+  tool_use / tool_result blocks) and emits one human-readable, date-prefixed
+  .txt per session so synthesize ingests actual conversations.
+
+Output basename is YYYY-MM-DD-<session8>.txt so transcript-discovery's DATE_RE
+can infer the date (enables `gbrain dream --date/--from/--to` scoping + dedup).
+
+Idempotent: a session is re-exported only when its .jsonl is newer than the
+existing .txt (mtime compare), so it is safe to run on every pipeline tick.
+
+Usage:
+  gbrain-export-transcripts [--src DIR] [--out DIR] [--min-chars N] [--force] [--json]
+
+Defaults:
+  --src  ~/.claude/projects/-Users-marcusclover-brain
+  --out  ~/.gbrain/transcripts
+  --min-chars 2000   (matches dream.synthesize.min_chars default; thinner
+                      transcripts are skipped because synthesize drops them anyway)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_SRC = Path.home() / ".claude" / "projects" / "-Users-marcusclover-brain"
+DEFAULT_OUT = Path.home() / ".gbrain" / "transcripts"
+
+
+def _text_from_content(content) -> str:
+    """Extract only user-visible text from a message.content field.
+
+    Drops thinking, tool_use, and tool_result blocks — those are noise for
+    synthesis. A user turn that is purely tool_result yields '' and is skipped.
+    """
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text", "")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+        return "\n\n".join(parts).strip()
+    return ""
+
+
+def _looks_like_injected(text: str) -> bool:
+    """Heuristic: skip turns that are pure harness injection, not real user input.
+
+    Claude Code injects system reminders, command stdout, and caveat banners as
+    'user' turns. They add no conversational signal and pollute synthesis. We
+    skip a user turn only when it is ENTIRELY wrapper content (starts with a
+    known injection marker and has no prose around it).
+    """
+    s = text.lstrip()
+    markers = (
+        "<system-reminder>",
+        "<command-name>",
+        "<command-message>",
+        "<local-command-stdout>",
+        "Caveat: The messages below were generated",
+        "[Request interrupted",
+    )
+    return s.startswith(markers)
+
+
+def export_session(jsonl: Path, out_dir: Path, min_chars: int, force: bool) -> dict:
+    """Parse one .jsonl session into a clean .txt. Returns a status dict."""
+    session_id = jsonl.stem
+    turns = []
+    first_ts = None
+    try:
+        with jsonl.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("isMeta") is True:
+                    continue
+                typ = o.get("type")
+                if typ not in ("user", "assistant"):
+                    continue
+                msg = o.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = _text_from_content(msg.get("content"))
+                if not text:
+                    continue
+                if role == "user" and _looks_like_injected(text):
+                    continue
+                ts = o.get("timestamp")
+                if first_ts is None and isinstance(ts, str):
+                    first_ts = ts
+                turns.append((role, ts, text))
+    except OSError as e:
+        return {"session": session_id, "status": "error", "detail": str(e)}
+
+    body_parts = []
+    for role, ts, text in turns:
+        label = "Marcus" if role == "user" else "Assistant"
+        when = f" [{ts}]" if ts else ""
+        body_parts.append(f"## {label}{when}\n\n{text}")
+    body = "\n\n".join(body_parts).strip()
+
+    # Date prefix from first timestamp, else file mtime.
+    if first_ts:
+        try:
+            date = first_ts[:10]
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            date = None
+    else:
+        date = None
+    if not date:
+        date = datetime.fromtimestamp(jsonl.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    header = f"# Claude Code session {session_id}\n# Date: {date}\n\n"
+    content = header + body + "\n"
+
+    if len(content) < min_chars:
+        return {"session": session_id, "status": "skipped_thin", "chars": len(content)}
+
+    out_path = out_dir / f"{date}-{session_id[:8]}.txt"
+
+    # Idempotency: skip if up to date.
+    if not force and out_path.exists():
+        if out_path.stat().st_mtime >= jsonl.stat().st_mtime:
+            return {"session": session_id, "status": "skipped_unchanged", "out": str(out_path)}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content, encoding="utf-8")
+    return {"session": session_id, "status": "written", "out": str(out_path), "chars": len(content)}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Export Claude Code .jsonl sessions to clean .txt transcripts.")
+    ap.add_argument("--src", type=Path, default=DEFAULT_SRC)
+    ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--min-chars", type=int, default=2000)
+    ap.add_argument("--force", action="store_true", help="Re-export even if .txt is newer than .jsonl")
+    ap.add_argument("--json", action="store_true", help="Emit JSON summary")
+    args = ap.parse_args()
+
+    if not args.src.is_dir():
+        print(f"src not found: {args.src}", file=sys.stderr)
+        return 2
+
+    # Top-level *.jsonl only (per-session logs); ignore subdir tool-results.
+    sessions = sorted(args.src.glob("*.jsonl"))
+    results = [export_session(s, args.out, args.min_chars, args.force) for s in sessions]
+
+    tally = {}
+    for r in results:
+        tally[r["status"]] = tally.get(r["status"], 0) + 1
+
+    if args.json:
+        print(json.dumps({"src": str(args.src), "out": str(args.out),
+                          "scanned": len(sessions), "tally": tally, "results": results}, indent=2))
+    else:
+        print(f"Scanned {len(sessions)} session(s) in {args.src}")
+        print(f"Output dir: {args.out}")
+        for status in ("written", "skipped_unchanged", "skipped_thin", "error"):
+            if status in tally:
+                print(f"  {status:18} {tally[status]}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

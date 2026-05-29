@@ -495,8 +495,18 @@ except Exception:
   fi
 
   log "   ${_C_DIM}▸${_C_RESET} starting supervisor in tmux session '$tmux_session'..."
-  tmux new-session -d -s "$tmux_session" \
-    "GBRAIN_ALLOW_SHELL_JOBS=1 $GBRAIN_BIN jobs supervisor start --allow-shell-jobs"
+  # Start via gbrain-agentic so the supervisor (and the dream subagents +
+  # significance-verdict judge it runs) inherit ANTHROPIC_API_KEY from
+  # secrets.env, scoped to this process tree. Without the key in the worker's
+  # env the synthesize phase silently no-ops: the verdict judge returns "no
+  # configured provider" and the legacy subagent's `new Anthropic()` throws
+  # "Could not resolve authentication method". A bare `gbrain jobs supervisor
+  # start` is key-less. Falls back to bare gbrain if the wrapper is missing.
+  local _sup_cmd="GBRAIN_ALLOW_SHELL_JOBS=1 $GBRAIN_BIN jobs supervisor start --allow-shell-jobs"
+  if [ -x "$HOME/bin/gbrain-agentic" ]; then
+    _sup_cmd="GBRAIN_ALLOW_SHELL_JOBS=1 $HOME/bin/gbrain-agentic jobs supervisor start --allow-shell-jobs"
+  fi
+  tmux new-session -d -s "$tmux_session" "$_sup_cmd"
   sleep 3
 
   if _sup_running; then
