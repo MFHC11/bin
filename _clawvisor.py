@@ -41,7 +41,7 @@ def _check_creds() -> None:
         missing.append("CLAWVISOR_BRAIN_TASK_ID")
     if missing:
         print(f"FATAL: missing env vars: {', '.join(missing)}", file=sys.stderr)
-        print("Run the master script ~/bin/brain-daily-9am.sh or `source` keychain reads first.", file=sys.stderr)
+        print("Run the master script ~/bin/brain-daily.sh or `source` keychain reads first.", file=sys.stderr)
         sys.exit(2)
 
 
@@ -51,12 +51,15 @@ def gateway_request(
     params: dict[str, Any],
     reason: str,
     data_origin: str | None = None,
+    timeout_sec: int | None = None,
 ) -> dict[str, Any]:
     """Make a ClawVisor gateway request. Returns the `result` dict on success.
 
     Raises RuntimeError on non-`executed` statuses (blocked, restricted, error).
+    timeout_sec overrides WAIT_TIMEOUT_SEC for slow actions (big attachments).
     """
     _check_creds()
+    wait_sec = timeout_sec or WAIT_TIMEOUT_SEC
     body = {
         "service": service,
         "action": action,
@@ -67,7 +70,7 @@ def gateway_request(
         "session_id": SESSION_ID,
         "context": {"source": "scheduled_task", "data_origin": data_origin},
     }
-    url = f"{CLAWVISOR_URL}/api/gateway/request?wait=true&timeout={WAIT_TIMEOUT_SEC}"
+    url = f"{CLAWVISOR_URL}/api/gateway/request?wait=true&timeout={wait_sec}"
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -78,7 +81,7 @@ def gateway_request(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=WAIT_TIMEOUT_SEC + 10, context=_SSL_CONTEXT) as resp:
+        with urllib.request.urlopen(req, timeout=wait_sec + 10, context=_SSL_CONTEXT) as resp:
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         try:

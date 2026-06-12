@@ -1,12 +1,12 @@
 # Dream Cycle — Stub Enrichment + Cross-Document Synthesis
 
 You are running the nightly Opus enrichment pass on Marcus Clover's gbrain
-second brain at `/Users/marcusclover/brain`. Today (2026-05-14) the brain
-gained 122 new entity stubs and 70+ modified compiled-truth pages from a
-parallel inbox-enrich run plus today's calendar+email sync via brain-run.
-Stubs are thin (~5 lines, "context: TBC" placeholders). Your job is to
-upgrade the most valuable stubs to genuine compiled-truth pages by mining
-the rest of the brain for context, then surface cross-document signal.
+second brain at `/Users/marcusclover/brain`. Today the brain has accumulated
+entity stubs and modified compiled-truth pages from inbox-enrich runs plus
+calendar+email syncs via brain-run. Stubs are thin (~5 lines, "context: TBC"
+placeholders). Your job is to upgrade the most valuable stubs to genuine
+compiled-truth pages by mining the rest of the brain for context, then
+surface cross-document signal.
 
 ## Context
 
@@ -14,16 +14,16 @@ the rest of the brain for context, then surface cross-document signal.
 - Owner: Marcus Clover (marcus@erv.io), Partner at ERV Fund II
 - Focus: ERV Fund II fundraising (FTSE100 anchor closed, first close 30 June),
   energy-sector VC dealflow, LP relationships
-- Today's date: 2026-05-14 (Europe/London authoritative)
+- Today's date: use today's actual date (Europe/London authoritative)
 - Tools available: Read, Edit, Write, Bash, `mcp__gbrain__search`, `mcp__gbrain__get_page`, `mcp__gbrain__find_anomalies`, `mcp__gbrain__find_contradictions`, `mcp__gbrain__get_backlinks`, `mcp__gbrain__traverse_graph`
 
 ## Scope (HARD CAPS — don't exceed)
 
 Enrich up to **15 stub pages** this run. Pick from the highest-signal categories:
 
-1. **LP family offices created today** (`companies/lp-*.md` modified after 2026-05-14)
+1. **LP family offices created recently** (`companies/lp-*.md` modified in last 7 days)
 2. **People with ≥3 backlinks across the brain** (likely material contacts whose stubs are now thin)
-3. **Today's meeting attendees** (`meetings/2026-05-14-*.md` references)
+3. **Today's meeting attendees** (`meetings/` files from today)
 4. **Stubs flagged with `tags: [stub, ...]` AND mentioned in ≥2 other pages**
 
 Identify the candidates via `mcp__gbrain__search` and `mcp__gbrain__get_backlinks`
@@ -54,7 +54,7 @@ Skip these categories outright:
    - Replacing `tags: [stub, mentioned-in-email]` with appropriate tags (no `stub` tag)
    - Adding a `## Compiled Truth` section above the existing `## Timeline`
    - Preserving ALL existing timeline entries and wikilinks — append, never replace
-   - Adding `enriched: 2026-05-14` to frontmatter so future runs skip this stub
+   - Adding `enriched: YYYY-MM-DD (use today's date)` to frontmatter so future runs skip this stub
 
 4. **Cross-link** — within the new compiled-truth section, wikilink any other
    brain entities you reference. Use canonical page headings (e.g. `[[Centrica]]`,
@@ -112,3 +112,7 @@ Follow with three sections:
 - **Top 5 anomalies / contradictions** (one line each, with file paths)
 - **Dedup candidates** (canonical → duplicate-to-retire)
 - **Patterns observed** (max 3)
+
+## Writing style (hard rule, added 2026-06-12)
+
+NEVER use em dashes (—) anywhere in your output: not in prose, headings, bullets, or frontmatter titles. Use a comma, colon, parentheses, or two sentences instead. En dashes inside numeric ranges (e.g. 350–700 bar) are fine. If you spawn subagents that write, copy this rule into their prompts verbatim.

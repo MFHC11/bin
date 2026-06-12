@@ -245,10 +245,20 @@ def collect():
     print(f"[email-collect] window={window!r} → {len(raw_msgs)} candidates "
           f"(pages={pages_fetched})", file=sys.stderr)
 
+    # --backfill-attachments: also revisit ALREADY-KNOWN messages to download
+    # their attachments (notes are never re-written for known ids — the email
+    # itself was already collected/enriched). Used for one-off historical
+    # sweeps; the daily run never passes it.
+    backfill_attachments = "--backfill-attachments" in sys.argv[1:]
+    backfilled = 0
+
     new_records: list[dict] = []
     for entry in raw_msgs:
         msg_id = entry.get("id") or entry.get("message_id")
-        if not msg_id or msg_id in known:
+        if not msg_id:
+            continue
+        already_known = msg_id in known
+        if already_known and not backfill_attachments:
             continue
 
         # Fetch full message
@@ -260,13 +270,19 @@ def collect():
                        "and any action items for filing into ~/brain/inbox/.",
                 data_origin=f"gmail:msg-{msg_id}",
             )
-        except RuntimeError as e:
+        except Exception as e:
+            # RuntimeError = ClawVisor policy/error; anything else is transient
+            # network (timeouts, SSL). Either way: skip this message, keep going.
             print(f"[email-collect] get_message {msg_id} failed: {e}", file=sys.stderr)
             continue
 
         msg_data = msg_result.get("data", {})
         rec = build_record(msg_id, msg_data)
         if not rec:
+            continue
+        if already_known:
+            if rec["category"] != "noise" and rec["has_attachments"]:
+                backfilled += download_attachments(rec)
             continue
         new_records.append(rec)
         known.add(msg_id)
@@ -411,16 +427,26 @@ def download_attachments(rec: dict) -> int:
         if dest.exists():
             att["saved_as"] = dest.name
             continue
-        try:
-            res = gateway_request(
-                GMAIL_SERVICE, "get_attachment",
-                {"message_id": rec["id"], "attachment_id": att["attachment_id"]},
-                reason="Daily brain-ingestion: download one PDF email attachment so it "
-                       "can be filed into ~/brain/inbox/ and converted to a brain page "
-                       "by the pdf-to-brain pipeline (read-only knowledge ingestion).",
-                data_origin=f"gmail:msg-{rec['id']}",
-            )
-        except RuntimeError as e:
+        res = None
+        last_err: Exception | None = None
+        for _attempt in (1, 2):  # big PDFs sometimes hit a gateway read timeout
+            try:
+                res = gateway_request(
+                    GMAIL_SERVICE, "get_attachment",
+                    {"message_id": rec["id"], "attachment_id": att["attachment_id"]},
+                    reason="Daily brain-ingestion: download one PDF email attachment so it "
+                           "can be filed into ~/brain/inbox/ and converted to a brain page "
+                           "by the pdf-to-brain pipeline (read-only knowledge ingestion).",
+                    data_origin=f"gmail:msg-{rec['id']}",
+                    timeout_sec=300,  # multi-MB PDFs exceed the default 120s gateway wait
+                )
+                break
+            except Exception as e:
+                last_err = e
+                if "timed out" not in str(e).lower():
+                    break
+        if res is None:
+            e = last_err
             msg = str(e)
             if "SCOPE_MISMATCH" in msg or "pending_scope_expansion" in msg or "restricted" in msg.lower():
                 _ATTACHMENT_SCOPE_BLOCKED = True

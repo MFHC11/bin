@@ -355,3 +355,7 @@ Remaining in inbox/:    <N>   (legacy + docs + next run)
   commit + sync after you exit.
 - **In subagent mode, do not enumerate.** Trust the file list from your
   parent wrapper. Do not look for additional unprocessed files.
+
+## Writing style (hard rule, added 2026-06-12)
+
+NEVER use em dashes (—) anywhere in your output: not in prose, headings, bullets, or frontmatter titles. Use a comma, colon, parentheses, or two sentences instead. En dashes inside numeric ranges (e.g. 350–700 bar) are fine. If you spawn subagents that write, copy this rule into their prompts verbatim.
