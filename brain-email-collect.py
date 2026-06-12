@@ -34,6 +34,21 @@ GMAIL_SERVICE = "google.gmail:marcus@erv.io"
 DEFAULT_WINDOW = "newer_than:1d"
 MAX_MESSAGES = 200  # per-call cap; collector loops if more pages exist
 
+# Body text carried into the inbox note. Raised from 1500/1200 (2026-06-12):
+# long emails were being truncated before enrichment ever saw them.
+BODY_CHARS = 10_000
+
+# Attachment download policy: only document types worth converting, and only
+# below a sanity cap. Inline signature images etc. are listed but never fetched.
+# Downloads go straight into ~/brain/inbox/ where brain-pdf-worker drains *.pdf.
+DOWNLOAD_MIMES = {"application/pdf"}
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+# Set True after the first SCOPE_MISMATCH so one run never spams ClawVisor
+# with doomed download requests. get_attachment requires a standing-task
+# scope expansion (POST /api/tasks/<task>/expand) approved by Marcus.
+_ATTACHMENT_SCOPE_BLOCKED = False
+
 
 def _resolve_window(argv: list[str]) -> str:
     """Build the Gmail `q:` value from CLI flags (or fall back to DEFAULT_WINDOW).
@@ -273,17 +288,21 @@ def collect():
 
     # Write to brain/inbox (inbox-enrich skill consumes these)
     written_to_inbox = 0
+    attachments_saved = 0
     for rec in new_records:
         if rec["category"] == "noise":
             continue
         path = inbox_filepath(rec)
         if path.exists():
             continue
+        attachments_saved += download_attachments(rec)
         path.write_text(format_inbox_md(rec))
         written_to_inbox += 1
 
     _heartbeat("ok", {"new_messages": len(new_records),
                       "inbox_files_written": written_to_inbox,
+                      "attachments_saved": attachments_saved,
+                      "attachment_scope_blocked": _ATTACHMENT_SCOPE_BLOCKED,
                       "window": window})
     print(f"[email-collect] {len(new_records)} new messages; {written_to_inbox} written to inbox/", file=sys.stderr)
     return new_records
@@ -334,6 +353,20 @@ def build_record(msg_id: str, data: dict) -> dict | None:
 
     snippet = body_text[:280].replace("\n", " ").strip()
 
+    # ClawVisor's get_message surfaces a flat attachments list:
+    # [{attachment_id, filename, mime_type, size}, ...]
+    attachments = []
+    for a in (data.get("attachments") or []):
+        if not isinstance(a, dict) or not a.get("filename"):
+            continue
+        attachments.append({
+            "attachment_id": a.get("attachment_id") or a.get("id") or "",
+            "filename": a["filename"],
+            "mime_type": (a.get("mime_type") or "").lower(),
+            "size": int(a.get("size") or 0),
+            "saved_as": None,  # filled by download_attachments()
+        })
+
     return {
         "id": msg_id,
         "thread_id": thread_id,
@@ -343,14 +376,85 @@ def build_record(msg_id: str, data: dict) -> dict | None:
         "cc": cc_addr,
         "subject": subject,
         "snippet": snippet,
-        "body_text_preview": body_text[:1500],
+        "body_text_preview": body_text[:BODY_CHARS],
         "gmail_link": gmail_link(msg_id),
         "contacts": contacts,
         "orgs": orgs,
         "category": category,
         "is_unread": bool(data.get("is_unread")),
         "labels": data.get("labels") or [],
+        "attachments": attachments,
+        "has_attachments": bool(attachments),
     }
+
+
+def download_attachments(rec: dict) -> int:
+    """Fetch downloadable attachments (PDFs) into ~/brain/inbox/ for the
+    pdf-to-brain worker. Mutates rec["attachments"][i]["saved_as"].
+
+    Fails soft: if the ClawVisor standing task lacks get_attachment scope
+    (SCOPE_MISMATCH / pending_scope_expansion), log once, stop trying for the
+    rest of the run, and leave the metadata-only listing in the inbox note.
+    Returns the number of files written.
+    """
+    global _ATTACHMENT_SCOPE_BLOCKED
+    saved = 0
+    for att in rec.get("attachments", []):
+        if _ATTACHMENT_SCOPE_BLOCKED:
+            break
+        if att["mime_type"] not in DOWNLOAD_MIMES:
+            continue
+        if not att["attachment_id"] or not (0 < att["size"] <= MAX_ATTACHMENT_BYTES):
+            continue
+        stem = slugify(Path(att["filename"]).stem, max_len=80)
+        dest = INBOX_DIR / f"{rec['date']}-attachment-{stem}.pdf"
+        if dest.exists():
+            att["saved_as"] = dest.name
+            continue
+        try:
+            res = gateway_request(
+                GMAIL_SERVICE, "get_attachment",
+                {"message_id": rec["id"], "attachment_id": att["attachment_id"]},
+                reason="Daily brain-ingestion: download one PDF email attachment so it "
+                       "can be filed into ~/brain/inbox/ and converted to a brain page "
+                       "by the pdf-to-brain pipeline (read-only knowledge ingestion).",
+                data_origin=f"gmail:msg-{rec['id']}",
+            )
+        except RuntimeError as e:
+            msg = str(e)
+            if "SCOPE_MISMATCH" in msg or "pending_scope_expansion" in msg or "restricted" in msg.lower():
+                _ATTACHMENT_SCOPE_BLOCKED = True
+                print("[email-collect] attachment download blocked by ClawVisor task "
+                      "scope — listing metadata only. Approve a get_attachment scope "
+                      "expansion for the brain-ingestion standing task to enable "
+                      "downloads.", file=sys.stderr)
+            else:
+                print(f"[email-collect] get_attachment failed for "
+                      f"{att['filename']!r}: {msg[:200]}", file=sys.stderr)
+            continue
+        d = res.get("data", {}) if isinstance(res, dict) else {}
+        blob = d.get("data") or d.get("content") or d.get("body") or ""
+        if not isinstance(blob, str) or not blob:
+            print(f"[email-collect] get_attachment returned no payload for "
+                  f"{att['filename']!r} (keys: {sorted(d) if isinstance(d, dict) else '?'})",
+                  file=sys.stderr)
+            continue
+        try:
+            raw = base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4))
+        except Exception as e:
+            print(f"[email-collect] b64 decode failed for {att['filename']!r}: {e}",
+                  file=sys.stderr)
+            continue
+        if not raw.startswith(b"%PDF"):
+            print(f"[email-collect] skipped {att['filename']!r}: payload is not a PDF "
+                  f"(header {raw[:8]!r})", file=sys.stderr)
+            continue
+        dest.write_bytes(raw)
+        att["saved_as"] = dest.name
+        saved += 1
+        print(f"[email-collect] saved attachment → inbox/{dest.name} "
+              f"({len(raw)} bytes)", file=sys.stderr)
+    return saved
 
 
 def extract_contacts(from_, to_, cc_) -> list[dict]:
@@ -421,11 +525,24 @@ def format_inbox_md(rec: dict) -> str:
 
     body_preview = rec.get("body_text_preview") or rec.get("snippet") or ""
 
+    attachments = rec.get("attachments") or []
+    att_lines = []
+    for a in attachments:
+        size_kb = a["size"] // 1024
+        if a.get("saved_as"):
+            att_lines.append(f"- {a['filename']} ({a['mime_type']}, {size_kb} KB) — saved to [[inbox/{a['saved_as']}]] for pdf-to-brain")
+        else:
+            att_lines.append(f"- {a['filename']} ({a['mime_type']}, {size_kb} KB) — not downloaded; fetch from Gmail if needed")
+    attachments_md = ""
+    if att_lines:
+        attachments_md = "\n### Attachments\n\n" + "\n".join(att_lines) + "\n"
+
     return f"""---
 type: inbox
 tags: {json.dumps(tag_set)}
 date: {rec['date']}
 thread_id: {rec['thread_id']}
+has_attachments: {str(rec.get('has_attachments', False)).lower()}
 ---
 
 # {rec['subject']}
@@ -438,8 +555,8 @@ thread_id: {rec['thread_id']}
 
 ### Summary
 
-{body_preview[:1200].strip()}
-
+{body_preview[:BODY_CHARS].strip()}
+{attachments_md}
 ### Contacts
 
 {contacts_md}

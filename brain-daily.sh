@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# brain-daily-9am.sh — runs once daily at 09:00 via cron.
+# brain-daily.sh — runs once daily at 17:00 via cron.
 #
 # Order:
 #   1. Pull Gmail via email-collector  (if CLAWVISOR creds present + script installed)
@@ -58,7 +58,7 @@ heartbeat() {
         >> "$dir/heartbeat.jsonl"
 }
 
-log "═══ brain-daily-9am.sh start ═══"
+log "═══ brain-daily.sh start ═══"
 
 # ─── 1. Email collector (Gmail via ClawVisor) ─────────────────────────────────
 
@@ -137,10 +137,20 @@ gbrain embed --stale >> "$LOG_FILE" 2>&1 \
     && log "  ✓ embed done" \
     || log "  ✗ embed failed"
 
+# extract dies intermittently on transient Supabase pooler drops
+# (write CONNECTION_CLOSED ...pooler.supabase.com:5432) — retry up to 3x.
 log "→ gbrain extract all --source db"
-gbrain extract all --source db >> "$LOG_FILE" 2>&1 \
-    && log "  ✓ extract done" \
-    || log "  ✗ extract failed"
+EXTRACT_OK=0
+for _attempt in 1 2 3; do
+    if gbrain extract all --source db >> "$LOG_FILE" 2>&1; then
+        EXTRACT_OK=1
+        log "  ✓ extract done (attempt $_attempt)"
+        break
+    fi
+    log "  ✗ extract attempt $_attempt failed (pooler drop is usually transient)"
+    [ "$_attempt" -lt 3 ] && sleep 30
+done
+[ "$EXTRACT_OK" -eq 1 ] || log "  ✗ extract failed after 3 attempts"
 
 # ─── 5. inbox-enrich subagent (Sonnet) ────────────────────────────────────────
 
@@ -166,18 +176,36 @@ PROMPT_FILE="$HOME/bin/prompts/inbox-enrich.md"
 SKILL_FILE="$HOME/bin/skills/inbox-enrich/SKILL.md"
 
 if [ -r "$PROMPT_FILE" ] && command -v claude >/dev/null 2>&1; then
-    log "  diag: ANTHROPIC_API_KEY=${#ANTHROPIC_API_KEY}ch CLAWVISOR_AGENT_TOKEN=${#CLAWVISOR_AGENT_TOKEN}ch CLAWVISOR_BRAIN_TASK_ID=${#CLAWVISOR_BRAIN_TASK_ID}ch"
-    log "→ inbox-enrich: invoking claude --print with $PROMPT_FILE (Sonnet 4.6)"
+    # Auth routing (2026-06-12 fix — this step failed every cron run since
+    # ~14 May with "Not logged in": the Max-plan OAuth credential lives in the
+    # login keychain, which cron cannot read).
+    #   Preferred: CLAUDE_CODE_OAUTH_TOKEN in ~/.gbrain/secrets.env (mint once
+    #   interactively with `claude setup-token`) → Max plan, $0 marginal.
+    #   Fallback:  keep ANTHROPIC_API_KEY set → pay-per-token API billing, but
+    #   the enrichment actually runs. Brain health > token cost (CLAUDE.md).
+    CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    log "  diag: ANTHROPIC_API_KEY(parent)=${#ANTHROPIC_API_KEY}ch CLAUDE_CODE_OAUTH_TOKEN=${#CLAUDE_CODE_OAUTH_TOKEN}ch CLAWVISOR_AGENT_TOKEN=${#CLAWVISOR_AGENT_TOKEN}ch CLAWVISOR_BRAIN_TASK_ID=${#CLAWVISOR_BRAIN_TASK_ID}ch"
     # Run Claude Code non-interactively, piping the prompt file as the user
     # message. --permission-mode bypassPermissions is required because
     # `claude --print` cannot prompt interactively for tool-use approval; the
     # cron job needs to write to ~/brain/ unattended.
-    if claude --print --model sonnet --permission-mode bypassPermissions < "$PROMPT_FILE" >> "$LOG_FILE" 2>&1; then
-        heartbeat inbox-enrich ok '{"model":"sonnet","prompt":"~/bin/prompts/inbox-enrich.md"}'
-        log "  ✓ inbox-enrich completed"
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        AUTH_MODE="max-plan-oauth-token"
+        log "→ inbox-enrich: invoking claude --print with $PROMPT_FILE (Sonnet, Max plan via CLAUDE_CODE_OAUTH_TOKEN)"
+        (unset ANTHROPIC_API_KEY; claude --print --model sonnet --permission-mode bypassPermissions < "$PROMPT_FILE") >> "$LOG_FILE" 2>&1
+        ENRICH_RC=$?
     else
-        heartbeat inbox-enrich error '{"model":"sonnet","prompt":"~/bin/prompts/inbox-enrich.md"}'
-        log "  ✗ inbox-enrich failed (see log)"
+        AUTH_MODE="api-key-fallback"
+        log "→ inbox-enrich: invoking claude --print with $PROMPT_FILE (Sonnet, API-key billing — run 'claude setup-token' once and add CLAUDE_CODE_OAUTH_TOKEN to ~/.gbrain/secrets.env to route back to Max plan)"
+        claude --print --model sonnet --permission-mode bypassPermissions < "$PROMPT_FILE" >> "$LOG_FILE" 2>&1
+        ENRICH_RC=$?
+    fi
+    if [ "$ENRICH_RC" -eq 0 ]; then
+        heartbeat inbox-enrich ok "{\"model\":\"sonnet\",\"auth\":\"$AUTH_MODE\",\"prompt\":\"~/bin/prompts/inbox-enrich.md\"}"
+        log "  ✓ inbox-enrich completed ($AUTH_MODE)"
+    else
+        heartbeat inbox-enrich error "{\"model\":\"sonnet\",\"auth\":\"$AUTH_MODE\",\"prompt\":\"~/bin/prompts/inbox-enrich.md\"}"
+        log "  ✗ inbox-enrich failed (see log; auth=$AUTH_MODE)"
     fi
 else
     REASON=""
@@ -187,6 +215,31 @@ else
     heartbeat inbox-enrich skipped "{\"reason\":\"$REASON\"}"
 fi
 
+# ─── 6. pdf-to-brain: async drain of inbox PDFs ───────────────────────────────
+#
+# Convert any PDFs sitting in inbox/ into rich sources/ pages, AFTER this daily
+# run, as a DETACHED background job so big decks (≈1 min/vision page) don't block
+# the cron. Resulting pages are ingested by the NEXT daily's gbrain sync (step 4),
+# ≈24h later — idempotent via content_hash. Mostly-text PDFs take a cheap
+# pure-python pymupdf4llm path; only chart/table decks pay for the vision pipeline.
+# The worker is self-healing: a PDF stays in inbox/ until it converts, so a killed
+# detached run is simply re-drained next daily.
+
+PDF_WORKER="$HOME/bin/brain-pdf-worker"
+shopt -s nullglob; _inbox_pdfs=( "$HOME"/brain/inbox/*.pdf ); shopt -u nullglob
+if [ ${#_inbox_pdfs[@]} -eq 0 ]; then
+    log "→ pdf-to-brain: no inbox PDFs"
+    heartbeat pdf-to-brain skipped '{"reason":"no-pdfs"}'
+elif [ -x "$PDF_WORKER" ] && command -v claude >/dev/null 2>&1; then
+    log "→ pdf-to-brain: ${#_inbox_pdfs[@]} inbox PDF(s) → async drain (detached; pages picked up next daily)"
+    nohup "$PDF_WORKER" </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    heartbeat pdf-to-brain ok "{\"queued\":${#_inbox_pdfs[@]},\"mode\":\"async-detached\"}"
+else
+    log "→ pdf-to-brain: SKIP (worker not executable or claude CLI missing)"
+    heartbeat pdf-to-brain skipped '{"reason":"no-worker-or-claude"}'
+fi
+
 # ─── Done ─────────────────────────────────────────────────────────────────────
 
-log "═══ brain-daily-9am.sh complete ═══"
+log "═══ brain-daily.sh complete ═══"
