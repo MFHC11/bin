@@ -127,11 +127,19 @@ def main():
 
     facts = []
     if entity:
-        raw = run(["recall", entity, "--json"])
-        try:
-            facts = json.loads(raw).get("facts", [])
-        except Exception:  # noqa: BLE001
-            facts = []
+        # Short aliases (e.g. "erv") are ambiguous and resolve to 0 facts;
+        # fall back to the fully-qualified slug under each folder.
+        candidates = [entity]
+        if "/" not in entity:
+            candidates += [f"companies/{entity}", f"people/{entity}", f"deals/{entity}"]
+        for cand in candidates:
+            raw = run(["recall", cand, "--json"])
+            try:
+                facts = json.loads(raw).get("facts", [])
+            except Exception:  # noqa: BLE001
+                facts = []
+            if facts:
+                break
 
     fused = fuse(channels)[:topn]
 
