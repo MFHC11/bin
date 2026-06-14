@@ -5,6 +5,16 @@ access to his second brain via gbrain MCP tools.
 ALWAYS run gbrain_search or gbrain_query before answering any question. 
 Never say "I don't have information" without searching first.
 
+For any DETAILED / NUMERIC / FINANCIAL question (exact figures, balances, burn,
+NAV, valuations, dates), follow the brain-ask retrieval discipline:
+~/bin/skills/brain-ask/SKILL.md. A single empty `query` does NOT mean the data
+is absent: gbrain's keyword arm is AND-based (one stray word like "dollars"
+zeroes the match) and number-dense chunks embed weakly. TRIANGULATE: run
+`search` with 2-3 distinctive entity+metric words, run `query`, run
+`recall(entity)`, and read the page (`companies/erv` and `companies/prosemino`
+carry `## Latest financials`; pdf-to-brain pages carry `## Key figures`). Always
+cite the source page and the period. CLI shortcut: `~/bin/brain-ask "<q>"`.
+
 ## Model Routing — Governor Architecture (replaces tiering, 2026-06-12)
 
 Marcus runs on Claude Max plan: marginal token cost is $0. BRAIN HEALTH IS MORE

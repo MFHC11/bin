@@ -62,13 +62,24 @@ Return ONLY a JSON object (no prose, no fences):
 {"title": "<a clean human title for this document>", "exec_summary": "<at most 200 words:
 the deck's overall thesis - the asset, the recommendation/conclusion, and the load-bearing
 facts>", "key_insights": ["<5-8 single-sentence, decision-relevant findings, specifics with
-figures preferred, each defensible from the notes>"], "companies": ["<organisations named:
-the target, competitors, advisors, acquirers>"], "people": ["<named individuals, if any>"]}
+figures preferred, each defensible from the notes>"], "key_figures": ["<8-20 SELF-CONTAINED
+metric lines, one figure each, written to be findable on their own without the surrounding
+table. Format: 'Metric name (entity, period): value'. Name the entity AND the period in
+EVERY line. E.g. 'ERV Group monthly net burn (May 2026): $129k combined, ERV $80k, Prosemino
+$49k'; 'Intercompany loan ERV Limited to Prosemino (31 May 2026): $3.317M'. Cover the figures
+a reader would later query: balances, burn, runway, revenue, NAV/MOIC, valuations, headcount,
+raise terms, tranches. Omit only if the document carries no quantified data.>"], "companies":
+["<organisations named: the target, competitors, advisors, acquirers>"], "people": ["<named
+individuals, if any>"]}
 ```
 
 Quality bar: the `key_insights` must stand alone — a reader of just that block understands
 the asset, the market size, and the recommendation, with figures. No padding, no two bullets
-making the same point.
+making the same point. The `key_figures` block is the retrieval surface for numeric queries:
+each line must be self-contained (entity + period + value) so it embeds as a concentrated
+chunk and stays findable by semantic search, rather than being diluted inside a wide table.
+When you edit this section, bump `PROMPT_VERSION` in `~/bin/pdf-to-brain` to invalidate the
+per-page cache.
 
 ## Writing style (hard rule, added 2026-06-12)
 

@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+# brain-ask — robust retrieval over the gbrain second brain.
+#
+# WHY: gbrain's `query` (semantic/hybrid) returns EMPTY for some phrasings of
+# detailed/numeric questions, because its keyword arm uses AND-based
+# websearch_to_tsquery (one absent word zeroes the match) and number-dense
+# chunks embed weakly. `search` (keyword) and `recall` (facts table) often
+# still have the answer. This wrapper fans out across all three channels and
+# fuses them with reciprocal-rank fusion, so a single brittle phrasing never
+# returns nothing. Use it for figures, financials, portfolio metrics, and any
+# "what is the exact number" question.
+#
+# Usage:
+#   brain-ask "what is the intercompany loan between Prosemino and ERV"
+#   brain-ask --entity erv "monthly net burn"        # also pulls facts for entity
+#   brain-ask -n 8 "ERV Fund II first close terms"   # top-N (default 6)
+#   brain-ask --json "..."                            # machine-readable fused list
+#
+# Exit 0 always (a brain question is never a build failure); prints "no hits"
+# to stderr if every channel is empty.
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+RRF_K = 60
+LINE_RE = re.compile(r"^\[(\d+\.\d+)\]\s+(\S+)\s+--\s+(.*)$")
+
+
+def run(args):
+    """Run a gbrain subcommand, return stdout (empty string on failure)."""
+    try:
+        env = dict(os.environ)
+        env.setdefault("GBRAIN_DISABLE_DIRECT_POOL", "1")
+        out = subprocess.run(
+            ["gbrain", *args],
+            capture_output=True, text=True, timeout=120, env=env,
+        )
+        return out.stdout
+    except Exception as e:  # noqa: BLE001
+        print(f"brain-ask: '{' '.join(args)}' failed: {e}", file=sys.stderr)
+        return ""
+
+
+def parse_hits(text):
+    """Parse gbrain query/search text output: '[score] slug -- snippet'.
+
+    Snippets wrap across lines; everything until the next '[score]' line
+    belongs to the current hit. Returns ordered [(score, slug, snippet), ...].
+    """
+    hits, cur = [], None
+    for line in text.splitlines():
+        m = LINE_RE.match(line)
+        if m:
+            if cur:
+                hits.append(cur)
+            cur = [float(m.group(1)), m.group(2), m.group(3)]
+        elif cur and line.strip():
+            cur[2] += " " + line.strip()
+    if cur:
+        hits.append(cur)
+    return [(sc, slug, snip.strip()) for sc, slug, snip in hits]
+
+
+# Per-channel fusion weights. Keyword `search` reliably finds exact figures and
+# entity names, so it gets the higher weight for the numeric/detail questions
+# this tool exists for. `query` adds semantic recall the keyword arm misses.
+WEIGHTS = {"search": 1.0, "query": 0.7}
+
+
+def fuse(channels):
+    """Fuse channels = {name: [(score, slug, snippet), ...]} by normalized
+    weighted score (each channel normalized to its own max, so the two score
+    scales are comparable), plus a small rank-RRF tiebreaker.
+
+    Returns [(slug, fused_score, snippet, [arms]), ...] sorted descending.
+    """
+    agg, best_snip, arms = {}, {}, {}
+    for name, hits in channels.items():
+        if not hits:
+            continue
+        top = max(sc for sc, _, _ in hits) or 1.0
+        w = WEIGHTS.get(name, 0.5)
+        for rank, (sc, slug, snip) in enumerate(hits):
+            contrib = w * (sc / top) + (1.0 / (RRF_K + rank))
+            # Down-weight thin stub / duplicate pages: they carry no figures and
+            # otherwise pollute the top of doubly-brittle queries.
+            low = snip.lower()
+            if "stub created" in low or "(duplicate)" in low or "duplicate stub" in low:
+                contrib *= 0.2
+            agg[slug] = agg.get(slug, 0.0) + contrib
+            arms.setdefault(slug, [])
+            if name not in arms[slug]:
+                arms[slug].append(name)
+            if len(snip) > len(best_snip.get(slug, "")):
+                best_snip[slug] = snip
+    fused = [(slug, sc, best_snip[slug], arms[slug]) for slug, sc in agg.items()]
+    fused.sort(key=lambda r: r[1], reverse=True)
+    return fused
+
+
+def main():
+    args = sys.argv[1:]
+    entity, topn, as_json, terms = None, 6, False, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--entity", "-e"):
+            entity = args[i + 1]; i += 2
+        elif a in ("-n", "--limit"):
+            topn = int(args[i + 1]); i += 2
+        elif a == "--json":
+            as_json = True; i += 1
+        else:
+            terms.append(a); i += 1
+    q = " ".join(terms).strip()
+    if not q:
+        print('usage: brain-ask [--entity SLUG] [-n N] [--json] "question"', file=sys.stderr)
+        return 0
+
+    channels = {
+        "query": parse_hits(run(["query", q])),
+        "search": parse_hits(run(["search", q])),
+    }
+
+    facts = []
+    if entity:
+        raw = run(["recall", entity, "--json"])
+        try:
+            facts = json.loads(raw).get("facts", [])
+        except Exception:  # noqa: BLE001
+            facts = []
+
+    fused = fuse(channels)[:topn]
+
+    if as_json:
+        print(json.dumps({
+            "question": q,
+            "results": [
+                {"slug": s, "score": round(sc, 4), "arms": ar, "snippet": sn}
+                for s, sc, sn, ar in fused
+            ],
+            "facts": facts,
+        }, indent=2))
+        return 0
+
+    if not fused and not facts:
+        print("brain-ask: no hits across query/search/recall.", file=sys.stderr)
+        return 0
+
+    if facts:
+        print(f"\n\033[1mFacts for '{entity}':\033[0m")
+        for f in facts[:topn]:
+            vf = f.get("valid_from", "")[:10]
+            print(f"  - [{vf}] {f.get('fact','')}")
+    print(f"\n\033[1mTop {len(fused)} pages (query + search fused):\033[0m")
+    for slug, sc, snip, ar in fused:
+        tag = "+".join(ar)
+        print(f"\n  \033[36m{slug}\033[0m  ({tag}, {sc:.3f})")
+        print(f"    {snip[:280]}")
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

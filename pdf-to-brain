@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+"""pdf-to-brain — convert a chart/table-heavy PDF into a rich, brain-ready markdown page.
+
+Routes pages by text-density + chart signals (pymupdf), runs a per-page Claude vision
+pass (Max-plan `claude --print`, no API key) that reads charts/tables and states the
+takeaway, synthesises doc-level Key insights (opus), and stages a finished page in
+sources/. Idempotent via content_hash; resumable via a per-page cache.
+
+Backend: Max-plan Claude CLI (no ANTHROPIC_API_KEY). See ~/.claude/plans for the design.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import fitz  # pymupdf
+    from PIL import Image
+except ImportError as e:
+    sys.exit(f"pdf-to-brain: missing dependency ({e}). Need pymupdf + Pillow.")
+
+HOME = Path.home()
+BRAIN = HOME / "brain"
+SOURCES = BRAIN / "sources"
+SOURCES_PDF = SOURCES / "pdf"
+STATE_ROOT = HOME / ".gbrain" / "pdf-vision"
+LEDGER = BRAIN / ".tasks" / "skill-evolution" / "pdf-to-brain" / "ledger.jsonl"
+
+PROMPT_VERSION = "v2"
+VISION_MODEL = "sonnet"
+SYNTH_MODEL = "opus"
+
+# ── Routing thresholds ──────────────────────────────────────────────────────
+# Vision is $0 marginal on the Max plan (only wall-clock), so we vision-pass by
+# default and only carve out genuine wall-of-prose pages where pdftotext is
+# already faithful (high text, almost no vector drawings, no embedded figures).
+TEXT_DENSE_CHARS = 1400  # prose char floor: below this => vision
+PROSE_DRAW_MAX = 4       # a true prose page has ~no vector drawings
+PROSE_COVER_MAX = 0.03   # and no embedded figure/screenshot
+# Document-level triage (deck vs report): if fewer than DOC_VISION_FRAC of pages
+# are genuinely "chart/figure", the whole PDF is a text document and gets a cheap
+# pure-python pymupdf4llm extraction — NO rasterise, NO vision, NO Claude.
+# A page counts as chart/figure if it has a real embedded figure (raster cover),
+# OR is a sparse slide, OR is a dense vector chart with little text. The last
+# clause is what separates a vector TABLE/CHART slide from a DESIGNED TEXT report
+# page (which also has many decorative drawings but high text density + no raster).
+# Tuned on real decks (frac ≥ 0.44) vs reports (frac ≤ 0.24).
+DOC_VISION_FRAC = 0.30
+DOC_FIGURE_COVER = 0.12   # raster coverage => a real embedded figure/chart
+DOC_SPARSE_CHARS = 700    # below this => a sparse slide (title/section/all-image)
+DOC_VECCHART_DRAWS = 40   # dense vector drawings ...
+DOC_VECCHART_CHARS = 1500 # ... AND text below this => a vector chart/table slide
+TARGET_LONG_EDGE = 1568
+RENDER_DPI = 144
+JPEG_QUALITY = 80
+DEFAULT_CONCURRENCY = 3
+MAX_PAGES_GUARD = 400
+
+# ── Prompts (the tuning surface; will move to ~/bin/prompts/pdf-to-brain.md on skill registration) ──
+PER_PAGE_PROMPT = """Read the image file at {image_path} using the Read tool. It is slide {page_no} of {total} from a management-consulting due-diligence deck. A raw text-layer extraction of the same slide is provided below as grounding (accurate for text/numbers, but it does NOT capture what charts mean).
+
+--- TEXT LAYER (grounding only) ---
+{page_text}
+--- END TEXT LAYER ---
+
+Transcribe THIS slide into structured markdown. Use the image as the source of truth for anything visual; use the text layer to get exact spellings and numbers right. Never invent numbers you cannot read (use "[illegible]"). Do not summarize tables — transcribe every row and column.
+
+Return ONLY a JSON object (no prose before or after, no markdown fences):
+{{"title": "<slide headline, verbatim if present>", "tables_markdown": "<every table as GitHub-flavored markdown, or empty string if none>", "data_points": ["<quantified readings off charts: series, units, the specific numbers/percentages>"], "body_markdown": "<any other slide text worth keeping>", "insight": "<2-4 sentences: what does this slide ARGUE? The takeaway, not a description of the visuals.>"}}"""
+
+SYNTH_PROMPT = """You are a partner-level analyst writing the top-of-document briefing for a knowledge base, from per-slide notes of a consulting due-diligence deck titled "{title}" ({total} slides). For every slide you are given its title, its argued insight, and key data points.
+
+--- PER-SLIDE NOTES ---
+{digest}
+--- END NOTES ---
+
+Return ONLY a JSON object (no prose, no fences):
+{{"title": "<a clean human title for this document, e.g. 'Project Neptuno - Commercial Due Diligence (Altman Solon)'>", "exec_summary": "<at most 200 words: the deck's overall thesis - the asset, the recommendation/conclusion, and the load-bearing facts>", "key_insights": ["<5-8 single-sentence, decision-relevant findings, specifics with figures preferred, each defensible from the notes>"], "key_figures": ["<8-20 SELF-CONTAINED metric lines, one figure each, written so the line is findable on its own without the surrounding table. Format: 'Metric name (entity, period): value'. Name the entity AND the period in EVERY line. E.g. 'ERV Group monthly net burn (May 2026): $129k combined, ERV $80k, Prosemino $49k'; 'Intercompany loan ERV Limited to Prosemino (31 May 2026): $3.317M'. Cover the figures a reader would later query: balances, burn, runway, revenue, NAV/MOIC, valuations, headcount, raise terms, tranches. Omit only if the document carries no quantified data.>"], "companies": ["<organisations named in the deck: the target, competitors, advisors, acquirers>"], "people": ["<named individuals, if any>"]}}"""
+
+
+# ── Config / args ───────────────────────────────────────────────────────────
+@dataclass
+class Cfg:
+    pages: str | None = None
+    sample: int | None = None
+    force_vision: bool = False
+    force_text: bool = False
+    route_threshold: int = TEXT_DENSE_CHARS
+    dry_run: bool = False
+    force: bool = False
+    simple: bool = False
+    sync: bool = False
+    concurrency: int = DEFAULT_CONCURRENCY
+    max_pages: int = MAX_PAGES_GUARD
+    out: str | None = None
+    verbose: bool = False
+    vision_model: str = VISION_MODEL
+    synth_model: str = SYNTH_MODEL
+
+
+def log(msg: str, *, err: bool = True) -> None:
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
+
+
+_print_lock = threading.Lock()
+
+
+def vlog(cfg: Cfg, msg: str) -> None:
+    if cfg.verbose:
+        with _print_lock:
+            log(msg)
+
+
+# ── Slug / hashing ──────────────────────────────────────────────────────────
+def derive_slug(pdf: Path) -> str:
+    stem = pdf.stem
+    stem = re.sub(r"[_-]?v?SENT$", "", stem, flags=re.I)
+    slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
+    return re.sub(r"-{2,}", "-", slug)
+
+
+def sha256_file(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ── Routing ─────────────────────────────────────────────────────────────────
+@dataclass
+class PageRoute:
+    page_no: int           # 1-indexed
+    mode: str              # "vision" | "text"
+    text: str
+    chars: int
+    n_draw: int
+    raster_cov: float
+
+
+def parse_pages_spec(spec: str, total: int) -> list[int]:
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return sorted(p for p in out if 1 <= p <= total)
+
+
+def route_pages(doc, scope: list[int], cfg: Cfg) -> list[PageRoute]:
+    routes: list[PageRoute] = []
+    for pno in scope:
+        page = doc[pno - 1]
+        text = page.get_text("text")
+        chars = len(text.strip())
+        n_draw = len(page.get_drawings())
+        parea = abs(page.rect.width * page.rect.height) or 1.0
+        cov = 0.0
+        for info in page.get_image_info():
+            x0, y0, x1, y1 = info.get("bbox", (0, 0, 0, 0))
+            cov += abs((x1 - x0) * (y1 - y0))
+        raster_cov = min(1.0, cov / parea)
+        if cfg.force_vision:
+            mode = "vision"
+        elif cfg.force_text:
+            mode = "text"
+        elif (chars >= cfg.route_threshold and n_draw <= PROSE_DRAW_MAX
+              and raster_cov < PROSE_COVER_MAX):
+            mode = "text"   # genuine wall-of-prose page; pdftotext is already faithful
+        else:
+            mode = "vision"
+        routes.append(PageRoute(pno, mode, text, chars, n_draw, raster_cov))
+    return routes
+
+
+# ── Rasterise ───────────────────────────────────────────────────────────────
+def render_page_jpeg(page) -> bytes:
+    zoom = RENDER_DPI / 72
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    scale = min(1.0, TARGET_LONG_EDGE / max(img.size))
+    if scale < 1.0:
+        img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=JPEG_QUALITY)
+    return buf.getvalue()
+
+
+# ── Claude CLI backend ──────────────────────────────────────────────────────
+def _extract_json(s: str) -> dict:
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
+        s = re.sub(r"\n?```$", "", s).strip()
+    start = s.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in output")
+    depth, instr, esc = 0, False, False
+    for i in range(start, len(s)):
+        c = s[i]
+        if instr:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                instr = False
+        else:
+            if c == '"':
+                instr = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(s[start:i + 1])
+    raise ValueError("unbalanced JSON object")
+
+
+def claude_call(prompt: str, model: str, allow_read: bool) -> str:
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)  # use Max-plan OAuth
+    cmd = ["claude", "--print", "--model", model, "--permission-mode", "bypassPermissions"]
+    if allow_read:
+        cmd += ["--allowedTools", "Read"]
+    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                          env=env, cwd=str(HOME))
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+    return proc.stdout
+
+
+def vision_extract(image_path: str, page_text: str, page_no: int, total: int, model: str) -> dict:
+    prompt = PER_PAGE_PROMPT.format(image_path=image_path, page_no=page_no, total=total,
+                                    page_text=page_text[:6000])
+    last = None
+    for attempt in range(2):
+        out = claude_call(prompt, model, allow_read=True)
+        try:
+            d = _extract_json(out)
+            d.setdefault("title", "")
+            d.setdefault("tables_markdown", "")
+            d.setdefault("data_points", [])
+            d.setdefault("body_markdown", "")
+            d.setdefault("insight", "")
+            return d
+        except (ValueError, json.JSONDecodeError) as e:
+            last = e
+            prompt += "\n\nReturn ONLY the JSON object, nothing else."
+    raise RuntimeError(f"page {page_no}: could not parse JSON ({last})")
+
+
+def synthesize(title: str, total: int, digest: str, model: str) -> dict:
+    prompt = SYNTH_PROMPT.format(title=title, total=total, digest=digest)
+    out = claude_call(prompt, model, allow_read=False)
+    d = _extract_json(out)
+    d.setdefault("title", "")
+    d.setdefault("exec_summary", "")
+    d.setdefault("key_insights", [])
+    d.setdefault("key_figures", [])
+    d.setdefault("companies", [])
+    d.setdefault("people", [])
+    return d
+
+
+# ── Per-page cache ──────────────────────────────────────────────────────────
+def page_hash(model: str, page_no: int, image: bytes, text: str) -> str:
+    h = hashlib.sha256()
+    h.update(f"{model}|{PROMPT_VERSION}|{page_no}|".encode())
+    h.update(image)
+    h.update(text.encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def process_vision_page(r: PageRoute, image: bytes, cache_dir: Path, cfg: Cfg) -> dict:
+    ph = page_hash(cfg.vision_model, r.page_no, image, r.text)
+    cf_path = cache_dir / f"{ph}.json"
+    if cf_path.exists() and not cfg.force:
+        vlog(cfg, f"  page {r.page_no}: cache hit")
+        return json.loads(cf_path.read_text())
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+        tf.write(image)
+        img_path = tf.name
+    try:
+        d = vision_extract(img_path, r.text, r.page_no, cfg._total, cfg.vision_model)
+    finally:
+        os.unlink(img_path)
+    d["_page"] = r.page_no
+    cf_path.write_text(json.dumps(d, ensure_ascii=False))
+    vlog(cfg, f"  page {r.page_no}: extracted ({len(d.get('tables_markdown',''))}c table, "
+              f"{len(d.get('insight',''))}c insight)")
+    return d
+
+
+# ── Assemble ────────────────────────────────────────────────────────────────
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _yaml_list(items: list[str]) -> str:
+    clean = []
+    for it in items or []:
+        it = str(it).strip().replace('"', "'")
+        if it:
+            clean.append(f'"{it}"')
+    return "[" + ", ".join(clean) + "]"
+
+
+def derive_title(pdf: Path) -> str:
+    t = re.sub(r"[_-]?v?SENT$", "", pdf.stem, flags=re.I)
+    t = re.sub(r"^\d{4}-\d{2}-\d{2}\s*[-_]\s*", "", t)   # strip a leading date
+    t = re.sub(r"\s*[_]+\s*", " ", t).strip(" -_")
+    return t or pdf.stem
+
+
+def build_frontmatter(pdf: Path, slug: str, content_hash: str, total: int,
+                      synth: dict, sample: bool, created: str,
+                      doc_type: str = "pdf-source") -> str:
+    title = (synth.get("_title") or pdf.stem.replace("_", " ")).replace('"', "'")
+    fm = [
+        "---", "type: note", f'title: "{title}"',
+        f'source: "{pdf.name}"', f"doc_type: {doc_type}",
+        f"ingested_via: pdf-to-brain@1", f'content_hash: "sha256:{content_hash}"',
+        f"pages: {total}", f"date: {now_iso()}",
+        f"created: {created}", f"updated: {now_iso()}",
+        "tags: [source, pdf]",
+        f"people: {_yaml_list(synth.get('people', []))}",
+        f"companies: {_yaml_list(synth.get('companies', []))}",
+    ]
+    if sample:
+        fm.append("sample: true")
+    fm.append("---")
+    return "\n".join(fm)
+
+
+def assemble(pdf: Path, slug: str, content_hash: str, total: int, scope: list[int],
+             routes: dict[int, PageRoute], results: dict[int, dict], synth: dict,
+             sample: bool, created: str) -> str:
+    title = synth.get("_title") or pdf.stem.replace("_", " ")
+    parts = [build_frontmatter(pdf, slug, content_hash, total, synth, sample, created)]
+    parts.append(f"\n# {title}\n")
+    scope_note = f" (pages {min(scope)}–{max(scope)} of {total})" if sample else ""
+    parts.append(f"> Source PDF ingested {now_iso()}{scope_note}. Synthesised by pdf-to-brain "
+                 f"(per-page vision + doc synthesis). Source: see `source:` frontmatter.\n")
+    if synth.get("exec_summary"):
+        parts.append(f"\n{synth['exec_summary']}\n")
+    ki = synth.get("key_insights") or []
+    if ki:
+        parts.append("\n## Key insights\n")
+        parts.extend(f"- {b}" for b in ki)
+        parts.append("")
+    # Key figures: self-contained 'Metric (entity, period): value' lines. Kept
+    # as a small, standalone section so each metric embeds as a concentrated
+    # chunk and stays findable by semantic query (not diluted inside a big
+    # table). See ~/bin/prompts/pdf-to-brain.md and the brain-ask retrieval skill.
+    kf = synth.get("key_figures") or []
+    if kf:
+        parts.append("\n## Key figures\n")
+        parts.extend(f"- {b}" for b in kf)
+        parts.append("")
+    parts.append("\n## Per-page synthesis\n")
+    for pno in scope:
+        r = routes[pno]
+        parts.append(f"\n### Page {pno}" + (f" — {results[pno]['title']}"
+                     if pno in results and results[pno].get("title") else ""))
+        if r.mode == "text":
+            body = r.text.strip()
+            parts.append(f"\n{body}\n" if body else "\n_(no text)_\n")
+            continue
+        d = results.get(pno, {})
+        if d.get("tables_markdown", "").strip():
+            parts.append("\n" + d["tables_markdown"].strip() + "\n")
+        if d.get("data_points"):
+            parts.append("\n" + "\n".join(f"- {p}" for p in d["data_points"]) + "\n")
+        if d.get("body_markdown", "").strip():
+            parts.append("\n" + d["body_markdown"].strip() + "\n")
+        if d.get("insight", "").strip():
+            parts.append(f"\n**Insight:** {d['insight'].strip()} (p{pno})\n")
+    parts.append("\n## See also\n\n- Source baseline (text-only): `inbox/" + slug + ".md`\n")
+    return "\n".join(parts)
+
+
+def simple_markdown(pdf: Path, scope: list[int]) -> str:
+    """Pure-python PDF->markdown for mostly-text documents (no vision, no Claude)."""
+    import pymupdf4llm
+    return pymupdf4llm.to_markdown(str(pdf), pages=[p - 1 for p in scope],
+                                   show_progress=False)
+
+
+def assemble_simple(pdf: Path, slug: str, content_hash: str, total: int,
+                    scope: list[int], md_body: str, sample: bool, created: str) -> str:
+    title = derive_title(pdf)
+    synth = {"_title": title}
+    fm = build_frontmatter(pdf, slug, content_hash, total, synth, sample, created,
+                           doc_type="pdf-text")
+    note = (" (pages %d-%d)" % (min(scope), max(scope))) if sample else ""
+    return "\n".join([
+        fm, f"\n# {title}\n",
+        f"> Source PDF ingested {now_iso()}{note}. Plain-text extraction (pymupdf4llm) — "
+        f"this PDF is mostly text, so no per-page vision pass was run. "
+        f"Source: see `source:` frontmatter.\n",
+        "\n" + md_body.strip() + "\n",
+    ])
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_existing_frontmatter(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    txt = path.read_text(encoding="utf-8", errors="replace")
+    m = re.match(r"^---\n(.*?)\n---", txt, re.S)
+    if not m:
+        return {}
+    fm = {}
+    for line in m.group(1).splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip().strip('"')
+    return fm
+
+
+def append_ledger(rec: dict) -> None:
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER.open("a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# ── Main ────────────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Convert a PDF into a rich brain-ready sources/ page.")
+    ap.add_argument("pdf", type=Path)
+    ap.add_argument("--pages", help="page subset, 1-indexed, e.g. 3,11-14,20")
+    ap.add_argument("--sample", type=int, help="process only the first N in-scope pages")
+    ap.add_argument("--force-vision", action="store_true")
+    ap.add_argument("--force-text", action="store_true")
+    ap.add_argument("--route-threshold", type=int, default=TEXT_DENSE_CHARS)
+    ap.add_argument("--dry-run", "-n", action="store_true")
+    ap.add_argument("--force", action="store_true", help="ignore per-page cache + hash-skip")
+    ap.add_argument("--simple", action="store_true",
+                    help="force simple pure-python text extraction (pymupdf4llm), no vision")
+    ap.add_argument("--sync", action="store_true", help="run brain-sync after staging")
+    ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    ap.add_argument("--max-pages", type=int, default=MAX_PAGES_GUARD)
+    ap.add_argument("--out", help="explicit output path")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    a = ap.parse_args()
+
+    cfg = Cfg(pages=a.pages, sample=a.sample, force_vision=a.force_vision,
+              force_text=a.force_text, route_threshold=a.route_threshold, dry_run=a.dry_run,
+              force=a.force, simple=a.simple, sync=a.sync, concurrency=a.concurrency,
+              max_pages=a.max_pages, out=a.out, verbose=a.verbose)
+
+    pdf = a.pdf.expanduser().resolve()
+    if not pdf.exists():
+        return log(f"pdf-to-brain: not found: {pdf}") or 2
+
+    doc = fitz.open(pdf)
+    total = doc.page_count
+    scope = parse_pages_spec(cfg.pages, total) if cfg.pages else list(range(1, total + 1))
+    if cfg.sample:
+        scope = scope[:cfg.sample]
+    if not scope:
+        return log("pdf-to-brain: empty page scope") or 2
+    if len(scope) > cfg.max_pages:
+        return log(f"pdf-to-brain: {len(scope)} pages > --max-pages {cfg.max_pages}; aborting") or 2
+    sample_mode = bool(cfg.pages or cfg.sample)
+    cfg._total = total
+
+    routes = route_pages(doc, scope, cfg)
+    route_by_no = {r.page_no: r for r in routes}
+    vision_pages = [r for r in routes if r.mode == "vision"]   # per-page RENDER routing
+    # Doc-level deck-vs-report signal (distinct from per-page render routing):
+    # excludes designed text reports (many decorative drawings, high text, no raster).
+    doc_visual = sum(1 for r in routes
+                     if r.raster_cov >= DOC_FIGURE_COVER
+                     or r.chars < DOC_SPARSE_CHARS
+                     or (r.n_draw >= DOC_VECCHART_DRAWS and r.chars < DOC_VECCHART_CHARS))
+    visual_frac = (doc_visual / len(routes)) if routes else 0.0
+    use_simple = cfg.simple or (not cfg.force_vision and visual_frac < DOC_VISION_FRAC)
+
+    if cfg.dry_run:
+        log(f"\nRoute table for {pdf.name} ({total}pp, {len(scope)} in scope):")
+        log(f"{'page':>5} {'mode':>7} {'chars':>6} {'draws':>6} {'cov':>5}")
+        for r in routes:
+            log(f"{r.page_no:>5} {r.mode:>7} {r.chars:>6} {r.n_draw:>6} {r.raster_cov:>5.2f}")
+        log(f"\n=> per-page: {len(vision_pages)} vision / {len(routes)-len(vision_pages)} text")
+        log(f"=> DOC-LEVEL: visual_frac={visual_frac:.2f} "
+            f"({'<' if visual_frac < DOC_VISION_FRAC else '>='} {DOC_VISION_FRAC}) -> "
+            f"{'SIMPLE (pymupdf4llm, no vision/Claude)' if use_simple else 'VISION pipeline'}")
+        return 0
+
+    content_hash = sha256_file(pdf)
+    slug = derive_slug(pdf)
+    out_path = (Path(cfg.out).expanduser().resolve() if cfg.out
+                else SOURCES / (f"{slug}.SAMPLE.md" if sample_mode else f"{slug}.md"))
+    created = now_iso()
+    if not sample_mode and out_path.exists() and not cfg.force:
+        ex = read_existing_frontmatter(out_path)
+        created = ex.get("created", created)
+        if ex.get("content_hash") == f"sha256:{content_hash}":
+            log(f"pdf-to-brain: {out_path.name} already current (content_hash match) — skipping. "
+                f"Use --force to re-run.")
+            return 0
+
+    if use_simple:
+        log(f"pdf-to-brain: {pdf.name} — SIMPLE text mode "
+            f"(visual_frac={visual_frac:.2f} < {DOC_VISION_FRAC}); pymupdf4llm, no vision/Claude")
+        md = assemble_simple(pdf, slug, content_hash, total, scope,
+                             simple_markdown(pdf, scope), sample_mode, created)
+        errors: list[int] = []
+        mode_note = "simple-text"
+    else:
+        cache_dir = STATE_ROOT / content_hash / "pages"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        log(f"pdf-to-brain: {pdf.name} — VISION mode, {len(scope)} pages "
+            f"({len(vision_pages)} vision), model={cfg.vision_model}, concurrency={cfg.concurrency}")
+
+        results: dict[int, dict] = {}
+        errors = []
+
+        def work(r: PageRoute):
+            image = render_page_jpeg(doc[r.page_no - 1])
+            return r.page_no, process_vision_page(r, image, cache_dir, cfg)
+
+        with cf.ThreadPoolExecutor(max_workers=cfg.concurrency) as ex:
+            futs = {ex.submit(work, r): r for r in vision_pages}
+            done = 0
+            for fut in cf.as_completed(futs):
+                r = futs[fut]
+                try:
+                    pno, d = fut.result()
+                    results[pno] = d
+                except Exception as e:  # noqa: BLE001
+                    errors.append(r.page_no)
+                    log(f"  page {r.page_no}: ERROR {e}")
+                done += 1
+                if done % 5 == 0 or done == len(vision_pages):
+                    log(f"  …{done}/{len(vision_pages)} vision pages")
+
+        digest_lines = []
+        for pno in scope:
+            if pno in results:
+                d = results[pno]
+                dl = f"## Page {pno} — {d.get('title','')}\nInsight: {d.get('insight','')}"
+                if d.get("data_points"):
+                    dl += "\nData: " + "; ".join(d["data_points"][:8])
+                digest_lines.append(dl)
+            else:
+                t = route_by_no[pno].text.strip().splitlines()
+                if t:
+                    digest_lines.append(f"## Page {pno} (text)\n{t[0][:200]}")
+        doc_title = derive_title(pdf)
+        synth = {"_title": doc_title}
+        try:
+            log(f"pdf-to-brain: synthesising Key insights ({cfg.synth_model})…")
+            s = synthesize(doc_title, total, "\n\n".join(digest_lines), cfg.synth_model)
+            synth.update(s)
+            synth["_title"] = s.get("title") or doc_title
+        except Exception as e:  # noqa: BLE001
+            log(f"pdf-to-brain: synthesis failed ({e}); writing page without Key insights")
+        md = assemble(pdf, slug, content_hash, total, scope, route_by_no, results, synth,
+                      sample_mode, created)
+        mode_note = "vision"
+
+    # Failure guard (added 2026-06-12, skill-evolution v2): if more than half the
+    # vision pages errored (e.g. claude CLI unavailable under cron), the output is
+    # a husk. Do NOT write it and do NOT move the PDF, so the worker retries on the
+    # next run instead of silently finalising garbage.
+    if mode_note == "vision" and scope and len(errors) > len(scope) / 2:
+        first_err = str(errors[0])[:200] if errors else ""
+        log(f"pdf-to-brain: ABORTING finalise — {len(errors)}/{len(scope)} vision pages "
+            f"errored; PDF left in place for retry. First error: {first_err}")
+        append_ledger({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "version": 2, "outcome": "fail", "cost_usd": 0.0,
+            "notes": f"{pdf.name}: vision, {len(scope)}pp, {len(errors)} errors, "
+                     f"ABORTED (no write/move). First: {first_err}",
+            "mode": "vision", "source": pdf.name, "content_hash": content_hash,
+            "pages": total, "slug": slug})
+        sys.exit(1)
+
+    write_atomic(out_path, md)
+    log(f"pdf-to-brain: wrote {out_path}  ({len(md)} bytes, {len(errors)} page errors, {mode_note})")
+
+    # move source PDF (full runs only)
+    if not sample_mode:
+        gi = (BRAIN / ".gitignore")
+        gi_ok = gi.exists() and any(l.strip().rstrip("/") == "sources/pdf"
+                                    for l in gi.read_text().splitlines())
+        if gi_ok:
+            SOURCES_PDF.mkdir(parents=True, exist_ok=True)
+            dest = SOURCES_PDF / pdf.name
+            if pdf.resolve() != dest.resolve():
+                os.replace(pdf, dest)
+                log(f"pdf-to-brain: moved source PDF -> {dest}")
+        else:
+            log("pdf-to-brain: NOT moving PDF — add 'sources/pdf/' to ~/brain/.gitignore first "
+                "(refusing to risk committing it).")
+
+    append_ledger({
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "version": 1, "outcome": "success" if not errors else "partial",
+        "cost_usd": 0.0, "notes": f"{pdf.name}: {mode_note}, {len(scope)}pp, "
+        f"visual_frac={visual_frac:.2f}, {len(errors)} errors, sample={sample_mode}",
+        "mode": mode_note,
+        "source": pdf.name, "content_hash": f"sha256:{content_hash}",
+        "pages": total, "slug": slug,
+    })
+
+    if cfg.sync and not sample_mode:
+        log("pdf-to-brain: running brain-sync…")
+        subprocess.run([str(HOME / "bin" / "brain-sync")], cwd=str(BRAIN))
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
