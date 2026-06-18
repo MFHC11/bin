@@ -1,0 +1,19 @@
+---
+name: project_dream_cycle_synthesis_fix
+description: "Why the gbrain dream-cycle synthesis silently no-op'd and the four fixes that made it write pages"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 8af903db-9ea0-4a12-a0a8-5407af023b9c
+---
+
+gbrain `dream` synthesize phase (v0.41.26.1) ran to exit 0 but wrote nothing. Four stacked causes, all config/setup (no gbrain code bug needing a fork; already past the v0.41.19.0 wiki-link fix):
+
+1. **Verdict judge (orchestrator) had no Anthropic key** → `makeJudgeClient` returns null → every transcript rejected "no configured provider" → 0 worth processing → `ok` with 0 pages. The judge runs in the *orchestrator* process (whoever runs `gbrain dream`), so the dream invocation itself needs the key.
+2. **Synthesis subagent (worker) had no key** → legacy path does `new Anthropic()` (subagent.ts:168) reading `process.env.ANTHROPIC_API_KEY` ONLY — it does NOT read gbrain config.json. So the *worker/supervisor* process also needs the key. Job died: "Could not resolve authentication method."
+3. **`agent.use_gateway_loop = true`** routed the subagent through the AI-SDK-v6 gateway tool loop, which throws `schema is not a function`. The stable default is the legacy Anthropic-direct path. Fix: `gbrain config unset agent.use_gateway_loop` (note: `config set` rejects the key as unknown; `unset` works).
+4. **`session_corpus_dir` pointed at the raw Claude Code projects dir** — discovery reads only `.txt`/`.md`, so it ingested 136 `tool-results/*.txt` noise dumps and ignored all 153 real `.jsonl` conversations. Fix: `~/bin/gbrain-export-transcripts` converts `.jsonl`→clean `.txt` into `~/.gbrain/transcripts/`; repointed corpus there.
+
+**The clean fix (single scoping mechanism):** launch the supervisor via `gbrain-agentic` so the key is in the worker's `process.env` — that covers BOTH the orchestrator verdict (gateway reads `{...envFromConfig, ...process.env}`) AND the legacy subagent (`new Anthropic()`). Do NOT add the key to config.json (reverted) and do NOT export it into ~/.zshrc (breaks `claude` Max routing). Run dream itself via the wrapper too, or as a shell job inside the key'd supervisor (the brain-run path).
+
+**Proven:** real-corpus `--date 2026-05-20` run judged 2/5 worth (3 correctly rejected as routine ops), wrote 3 real pages incl. `wiki/personal/reflections/2026-05-20-network-path-to-marco-nix-elia-group`. See [[project_dream_corpus_choice]].

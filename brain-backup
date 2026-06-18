@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# brain-backup — one safe, best-practice "back up the brain" process.
+#
+# WHY THIS EXISTS
+#   Marcus should never have to specify git/push/supabase mechanics. He says
+#   "back up the brain" (or an agent / the daily runs this) and the correct,
+#   verified process happens end-to-end. Lessons are baked in so past mistakes
+#   don't repeat (notably: a 219MB inbox zip once blocked the push for 50+ commits).
+#
+# WHAT IT BACKS UP (everything needed to rebuild after disk loss)
+#   1. The brain content   → GitHub (MFHC11/brain) + Supabase (gbrain)
+#   2. The scripts/skills   → GitHub (MFHC11/bin, i.e. ~/bin)
+#   3. The Claude memory    → snapshot inside ~/bin (claude-brain-memory/), which
+#                             rides the bin repo to GitHub (no separate repo / no gh)
+#
+# WHAT IT DOES (in order)
+#   1. Pre-flight + large-file guard   (never let a >95MB file into a commit)
+#   2. Stage + commit + push the brain (auto-purge a large-file block from
+#                                       unpushed history, then retry once)
+#   3. Sync Supabase (gbrain sync + embed --stale)
+#   4. Back up scripts + Claude memory snapshot via the bin repo
+#   5. VERIFY everything and report a clear PASS / FAIL
+#
+# MODES
+#   brain-backup            full backup, then verify
+#   brain-backup --check    verification tests only, no writes (the self-test)
+#   brain-backup --auto     same as default (explicit name for the cron caller)
+#   brain-backup --reason "msg"   custom commit-message suffix
+#
+# EXIT  0 = all good / verified;  1 = a step or a verification failed.
+
+set -u
+
+BRAIN_REPO="${BRAIN_REPO:-$HOME/brain}"
+BIN_REPO="${BIN_REPO:-$HOME/bin}"
+MEMORY_DIR="${CLAUDE_MEMORY_DIR:-$HOME/.claude/projects/-Users-marcusclover-brain/memory}"
+MEMORY_SNAPSHOT="$BIN_REPO/claude-brain-memory"
+GIT_MAX_BYTES=99614720   # 95 MiB per-file ceiling (GitHub hard limit is 100MB)
+MODE="run"
+REASON=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) MODE="check" ;;
+        --auto)  MODE="run" ;;
+        --reason) shift; REASON="${1:-}" ;;
+        *) echo "brain-backup: unknown arg: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+export GBRAIN_DISABLE_DIRECT_POOL=1
+[ -r "$HOME/.gbrain/secrets.env" ] && . "$HOME/.gbrain/secrets.env"
+
+DATE_TAG="$(date -u +%Y-%m-%d)"
+ok()   { printf '  ✓ %s\n' "$1"; }
+bad()  { printf '  ✗ %s\n' "$1"; }
+warn() { printf '  ! %s\n' "$1"; }
+step() { printf '→ %s\n' "$1"; }
+
+cd "$BRAIN_REPO" 2>/dev/null || { bad "cannot cd to $BRAIN_REPO"; exit 1; }
+[ -d .git ] || { bad "$BRAIN_REPO is not a git repo"; exit 1; }
+
+# ── list paths >GIT_MAX_BYTES living in commits not yet on origin (cwd repo) ───
+oversize_in_history() {
+    git rev-list origin/main..HEAD --objects 2>/dev/null \
+      | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' 2>/dev/null \
+      | awk -v max="$GIT_MAX_BYTES" '$1=="blob" && ($2+0)>max { $1=""; $2=""; sub(/^  /,""); print }' \
+      | sort -u
+}
+
+# ── purge oversize blobs from unpushed history (the 219MB-zip remedy; cwd repo) ─
+purge_oversize_history() {
+    local paths; paths="$(oversize_in_history)"
+    [ -z "$paths" ] && return 1
+    warn "large file(s) baked into unpushed history; purging to unblock push:"
+    printf '%s\n' "$paths" | while IFS= read -r p; do [ -n "$p" ] && echo "      - $p"; done
+    local rmcmd="git rm -r --cached --ignore-unmatch"
+    while IFS= read -r p; do [ -n "$p" ] && rmcmd="$rmcmd \"$p\""; done <<EOF
+$paths
+EOF
+    cp .git/refs/heads/main "/tmp/brain-backup-$(basename "$PWD")-$(git rev-parse --short HEAD).ref" 2>/dev/null || true
+    FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch --force \
+        --index-filter "$rmcmd" -- origin/main..HEAD >/dev/null 2>&1
+    rm -rf .git/refs/original 2>/dev/null || true
+    return 0
+}
+
+# ── generic: stage (guard >95MB), commit, push (purge+retry on block) ─────────
+# Usage: backup_repo <repo_dir> <commit_msg> <label>.  Echoes ✓/✗; returns 0/1.
+backup_repo() {
+    local repo="$1" msg="$2" label="$3"
+    ( cd "$repo" 2>/dev/null || { bad "$label: cannot cd to $repo"; exit 1; }
+      [ -d .git ] || { bad "$label: not a git repo"; exit 1; }
+      git add -A
+      while IFS= read -r -d '' f; do
+          [ -f "$f" ] || continue
+          s=$(wc -c < "$f" 2>/dev/null || echo 0)
+          if [ "$s" -gt "$GIT_MAX_BYTES" ]; then
+              git reset -q HEAD -- "$f" 2>/dev/null || true
+              warn "$label: unstaged oversize file ($((s/1024/1024))MB), left on disk: $f"
+          fi
+      done < <(git diff --cached --name-only -z)
+      if git diff --cached --quiet; then ok "$label: nothing new to commit"; exit 0; fi
+      git commit -q -m "$msg" || { bad "$label: commit failed"; exit 1; }
+      ok "$label: committed"
+      local plog; plog="$(git push origin HEAD 2>&1)"
+      if [ $? -eq 0 ]; then ok "$label: pushed to GitHub"; exit 0; fi
+      if printf '%s' "$plog" | grep -qiE 'exceeds .*file size limit|Large files detected|GH001'; then
+          warn "$label: push blocked by a large file; auto-remediating"
+          if purge_oversize_history && git push origin HEAD >/dev/null 2>&1; then
+              ok "$label: pushed after history purge"; exit 0
+          fi
+          bad "$label: still blocked after purge:"; printf '%s\n' "$plog" | sed 's/^/      /'; exit 1
+      fi
+      bad "$label: push failed (not a size issue):"; printf '%s\n' "$plog" | sed 's/^/      /'; exit 1
+    )
+}
+
+# ── refresh the Claude memory snapshot inside the bin repo ─────────────────────
+refresh_memory_snapshot() {
+    [ -d "$MEMORY_DIR" ] || return 1
+    [ -d "$BIN_REPO/.git" ] || return 1
+    mkdir -p "$MEMORY_SNAPSHOT"
+    if [ ! -f "$MEMORY_SNAPSHOT/RESTORE.md" ]; then
+        cat > "$MEMORY_SNAPSHOT/RESTORE.md" <<'RST'
+# Claude brain-memory — backup snapshot
+
+This is a mirror of the live Claude memory store, kept here so it rides the
+`~/bin` GitHub repo and survives disk loss. The live store is at:
+
+    ~/.claude/projects/-Users-marcusclover-brain/memory/
+
+Refreshed automatically by `~/bin/brain-backup` (and the daily). To RESTORE on a
+new machine:
+
+    rsync -a --exclude RESTORE.md <this-dir>/ \
+      ~/.claude/projects/-Users-marcusclover-brain/memory/
+RST
+    fi
+    rsync -a --delete --exclude RESTORE.md "$MEMORY_DIR"/ "$MEMORY_SNAPSHOT"/ 2>/dev/null
+}
+
+# ── verification (the built-in tests) ─────────────────────────────────────────
+verify() {
+    local fails=0
+    step "verify: running backup tests"
+
+    # T1: brain working tree clean
+    if [ -z "$(git -C "$BRAIN_REPO" status --porcelain)" ]; then ok "brain: tree clean"
+    else bad "brain: uncommitted changes"; fails=$((fails+1)); fi
+
+    # T2: no oversize blob in brain unpushed history
+    if [ -z "$(cd "$BRAIN_REPO" && oversize_in_history)" ]; then ok "brain: no >95MB file in unpushed history"
+    else bad "brain: oversize file still in unpushed history"; fails=$((fails+1)); fi
+
+    # T3: brain HEAD == origin/main
+    git -C "$BRAIN_REPO" fetch -q origin main 2>/dev/null || true
+    local bh br; bh="$(git -C "$BRAIN_REPO" rev-parse HEAD 2>/dev/null)"; br="$(git -C "$BRAIN_REPO" rev-parse origin/main 2>/dev/null || echo none)"
+    if [ "$bh" = "$br" ]; then ok "brain: GitHub up to date (${bh:0:8})"
+    else bad "brain: GitHub behind (HEAD ${bh:0:8} != origin ${br:0:8})"; fails=$((fails+1)); fi
+
+    # T4: Supabase checkpoint == brain HEAD
+    local cp; cp="$(gbrain sync --repo "$BRAIN_REPO" 2>&1 | grep -oE 'Checkpoint: [0-9a-f]+' | awk '{print $2}' | tail -1)"
+    if [ -z "$cp" ]; then ok "brain: Supabase already current"
+    elif [ "${bh:0:${#cp}}" = "$cp" ]; then ok "brain: Supabase in sync (checkpoint $cp)"
+    else bad "brain: Supabase checkpoint $cp != HEAD ${bh:0:8}"; fails=$((fails+1)); fi
+
+    # T5: scripts repo (~/bin) clean + pushed
+    if [ -d "$BIN_REPO/.git" ]; then
+        git -C "$BIN_REPO" fetch -q origin main 2>/dev/null || true
+        local nh nr; nh="$(git -C "$BIN_REPO" rev-parse HEAD 2>/dev/null)"; nr="$(git -C "$BIN_REPO" rev-parse origin/main 2>/dev/null || echo none)"
+        if [ -n "$(git -C "$BIN_REPO" status --porcelain)" ]; then bad "scripts (~/bin): uncommitted changes"; fails=$((fails+1))
+        elif [ "$nh" = "$nr" ]; then ok "scripts (~/bin): GitHub up to date (${nh:0:8})"
+        else bad "scripts (~/bin): GitHub behind (${nh:0:8} != ${nr:0:8})"; fails=$((fails+1)); fi
+    fi
+
+    # T6: Claude memory snapshot matches the live store
+    if [ -d "$MEMORY_DIR" ] && [ -d "$MEMORY_SNAPSHOT" ]; then
+        local drift; drift="$(rsync -ain --delete --exclude RESTORE.md "$MEMORY_DIR"/ "$MEMORY_SNAPSHOT"/ 2>/dev/null | grep -vE '^$|/$' )"
+        if [ -z "$drift" ]; then ok "Claude memory: snapshot current and backed up"
+        else bad "Claude memory: snapshot drifted from live store (re-run backup)"; fails=$((fails+1)); fi
+    fi
+
+    echo
+    if [ "$fails" -eq 0 ]; then echo "RESULT: PASS — brain, scripts and memory all backed up and verified"; return 0
+    else echo "RESULT: FAIL — $fails check(s) failed (see above)"; return 1; fi
+}
+
+# ── --check mode: tests only, no writes ───────────────────────────────────────
+if [ "$MODE" = "check" ]; then
+    echo "═══ brain-backup --check (verify only) ═══"
+    verify; exit $?
+fi
+
+echo "═══ brain-backup ═══"
+RC=0
+
+# 1+2. brain: stage/commit/push
+_msg="brain backup ${DATE_TAG}"; [ -n "$REASON" ] && _msg="brain backup ${DATE_TAG}: $REASON"
+step "backing up the brain (GitHub)"
+backup_repo "$BRAIN_REPO" "$_msg" "brain" || RC=1
+
+# 3. Supabase
+step "syncing Supabase"
+gbrain sync --repo "$BRAIN_REPO" >/dev/null 2>&1 && ok "sync done" || warn "sync reported an issue (verify will catch it)"
+gbrain embed --stale >/dev/null 2>&1 && ok "embed done" || warn "embed reported an issue (verify will catch it)"
+
+# 4. scripts + Claude memory snapshot (ride the ~/bin repo)
+step "backing up scripts (~/bin) + Claude memory snapshot"
+if refresh_memory_snapshot; then ok "Claude memory: snapshot refreshed in ~/bin"
+else warn "Claude memory: snapshot skipped (memory dir or bin repo missing)"; fi
+if [ -d "$BIN_REPO/.git" ]; then
+    backup_repo "$BIN_REPO" "backup: scripts + Claude memory snapshot ${DATE_TAG}" "scripts+memory" || RC=1
+else
+    warn "scripts (~/bin): no git repo, skipped"
+fi
+
+# 5. verify
+echo
+verify || RC=1
+exit $RC

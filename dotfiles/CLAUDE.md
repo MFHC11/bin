@@ -83,8 +83,11 @@ genuine scope changes — never for cost or model choice.
 - Always use ~/bin/skills/sunday-briefing/SKILL.md when generating Sunday or weekly briefings
 - Triggers: "Sunday briefing", "weekly briefing", "brief me for the week", "chief of staff briefing", "what's on this week"
 - Authoritative instructions: ~/bin/prompts/sunday-briefing.md (read fresh each run)
-- Mandatory data-pipeline order: money-flow pages → silence-age check → tasks → inbox → calendar → daily notes
+- Two-layer model (added 2026-06-14): the STRATEGIC layer is the Priority Ledger (brain page `concepts/erv-priority-ledger`, the ~8-10 ERV "rocks", maintained by the CoS agent); the OPERATIONAL/EA layer is `tasks/active.md`. The brief reconciles the ledger FIRST (Section 0), then the EA layers.
+- Mandatory data-pipeline order: **priority ledger (Section 0)** → money-flow pages → silence-age check → tasks → inbox → calendar → daily notes
 - Hard rule: commercial actions (HoldCo, NAV loan, Fund II DDQ) ALWAYS rank above process items (IQ-EQ, fund admin)
+- Freshness rule (added 2026-06-14): a fresh, high-stakes item (e.g. a term sheet received in the last few days) OUTRANKS a well-documented routine one. Do not let the briefing mirror brain-coverage density instead of Marcus's actual priorities.
+- CoS cadence: reconcile the ledger every Sunday brief AND prompt Marcus in-session whenever a rock stalls past its chase cadence or a deadline nears (no automated cron yet, agreed 2026-06-14). After each brief, UPDATE the ledger (status, last-moved, change log).
 - Default model: Sonnet 4.6 (~$0.30-1.20); Opus 4.7 first-of-month or post-failure
 
 ## LP FOLLOW-UP EMAIL SKILL
@@ -95,10 +98,28 @@ genuine scope changes — never for cost or model choice.
 - MANDATORY clarification gate before drafting — junior-analyst pre-flight on (1) LP identity, (2) status + recent meeting context, (3) intent of THIS email. Surface what the brain knows first, ask only the gaps.
 - Mandatory data-pipeline order: corrections file → LP page + pipeline → recent meeting note → Fund II top-line → Fund II forward pipeline → Fund I winners → platform + network → context-driven close
 - Hard rules in the email: no NAV/MOIC/IRR/DPI/TVPI; no Divigas/Ecolectro; no macro caveats; no "we're working on / exploring"; named third parties (Sanmina, Vattenfall, UBE, ArcelorMittal, Moelis, Ord Minnett, British Land) unexplained; first-person voice; no subject/signature scaffolding
+- ⛔ ANCHOR CONFIDENTIALITY (2026-06-18, hard rule, applies to ALL ERV LP-facing copy: follow-up emails, cold outreach, blurbs, decks, intros): NEVER disclose the Fund II anchor's name (Centrica) without Marcus's explicit per-recipient approval. "British Gas" / "British Gas parent" also identify it and are forbidden. Always write "a FTSE-100 energy company". Full rule + canonical phrasing: ~/bin/prompts/lp-follow-up-email-corrections.md; brain note: concepts/centrica-anchor-confidential
 - Close is sourced from the actual meeting note (action agreed, intro promised, follow-up cadence). Fallback to a contextual offer only when no meeting thread exists.
 - Output: ~/brain/drafts/lp-follow-up-emails/YYYY-MM-DD-<lp-slug>.md (email body + working notes section)
 - Default model: Sonnet (~$0.30-0.80); Opus only for top-tier LP first-touch
 - Human-initiated only — no cron, no automation
+
+## PORTFOLIO DISCLOSURE (no-NDA) SKILL
+- Always use ~/bin/skills/portfolio-disclosure/SKILL.md when any task puts a portfolio-company fact (or the Fund II anchor) in front of a third party WITHOUT an NDA: LP emails, cold outreach, intros, blurbs, decks, one-pagers, DMs, verbal-prep notes
+- Triggers: "introducing a portfolio company", "intro <portco> to <third party>", "what can I share about <portco>", "can we say <fact>", "is this confidential / shareable without an NDA", "portfolio blurb/deck for a third party"
+- Authoritative instructions: ~/bin/prompts/portfolio-disclosure.md (read fresh each run); company-specific figure overrides + named confidentiality items: ~/bin/prompts/lp-follow-up-email-corrections.md (wins on specific conflict); brain note: concepts/portfolio-disclosure-without-nda
+- Composes with lp-follow-up-email and cold LP outreach (they inherit it)
+- Three tiers: T1 shareable (public / what-it-does / stage / public grants / qualitative traction) · T2 genericise (customer & offtaker names, exact financials, valuation, cap table, named pipeline → descriptors) · T3 never without Marcus's explicit per-recipient approval (anchor name = Centrica; anyone else's confidential info / term sheets; distress framing; pre-IPO MNPI; personal details)
+- When unsure, ask Marcus; approval is per-recipient and does not carry forward
+
+## BRAIN BACKUP SKILL
+- Backing up the brain is ONE process: `~/bin/brain-backup` (commit, push to GitHub, sync Supabase, then verify). Never hand-run git/gbrain commands for a backup; never ask Marcus about commit/push/sync mechanics.
+- Always use ~/bin/skills/brain-backup/SKILL.md; authoritative process in ~/bin/prompts/brain-backup.md; brain ADR concepts/brain-backup-process
+- Triggers: "back up the brain", "ready to back up", "save the brain", "backup brain", "is the brain backed up/saved", any request to persist/secure brain work
+- Plain-language gate: confirm "Ready to back up the brain?" before running (skip if Marcus already said go). Use plain words to Marcus, never "push/commit/rebase/sync".
+- Engine self-heals known failures (unstages >95MB files; purges a large blob from un-backed-up history and retries the push — the 219MB-zip remedy) and verifies HEAD == origin/main and gbrain checkpoint == HEAD. `~/bin/brain-backup --check` = verify-only self-test.
+- The daily (~/bin/brain-daily.sh step 6) calls this engine automatically, so routine work is backed up each run; the skill is for on-demand backups + status checks.
+- If a new failure mode appears: fix ~/bin/brain-backup, re-test (--check + a real run), update the ADR and memory feedback_brain_backup_process. Do NOT repeat a known mistake.
 
 ## SKILL EVOLUTION (MCE)
 - After every skill execution (inbox-enrich, sunday-briefing, lp-follow-up-email), append one JSONL entry to `~/brain/.tasks/skill-evolution/<skill-name>/ledger.jsonl`

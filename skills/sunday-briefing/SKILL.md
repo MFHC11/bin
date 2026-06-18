@@ -18,10 +18,14 @@ triggers:
   - "generate the briefing"
   - any task asking for a synthesis of last 7 days + next 7 days for ERV
 mutating: true
-writes_pages: false
+writes_pages: true   # maintains concepts/erv-priority-ledger (the strategic layer)
 writes_to:
   - .tasks/briefing-YYYY-MM-DD.md
+  - .tasks/briefing-YYYY-MM-DD.html (when an HTML/readable version is requested)
+  - concepts/erv-priority-ledger.md (reconciled + updated each run)
 sources_required:
+  priority_ledger:
+    - concepts/erv-priority-ledger.md (READ FIRST, reconcile as Section 0, UPDATE after the brief)
   brain_pages:
     - companies/invicta-wealth-solutions.md
     - companies/lp-energy-revolution-ventures-limited.md
@@ -66,10 +70,15 @@ fresh at task start** — it's edited periodically and this summary may drift.
 - **Portfolio company update** — use a portfolio-specific synthesis, not the briefing format.
 - **Granola transcript review** — has its own workflow.
 
+## Two-layer model (added 2026-06-14)
+
+The briefing runs two layers: a **strategic layer** (the Priority Ledger, `concepts/erv-priority-ledger`, the ~8-10 ERV "rocks", maintained by the CoS agent) and an **operational/EA layer** (`tasks/active.md`, inbox, calendar). Lead with the ledger, retain the full EA picture. **Freshness rule:** a fresh high-stakes item outranks a well-documented routine one; the brief reflects Marcus's priority stack, not brain-coverage density. Be proactive: surface risks/deadlines Marcus has not flagged, and ask employee-grade follow-up questions when he names a new priority.
+
 ## Mandatory data-pipeline order (do NOT shortcut)
 
 The default calendar-first pipeline produces process bias and inverts Marcus's priority hierarchy. **Run in this exact sequence:**
 
+0. **Priority Ledger first** (`concepts/erv-priority-ledger`): reconcile every rock (moved? STALE? deadline within 14 days?). Report in Section 0; write updates back after the brief.
 1. **Money-flow pages first** (read in full, do not search/skim):
    - `companies/invicta-wealth-solutions.md` — every open HoldCo subscription
    - `companies/lp-energy-revolution-ventures-limited.md` — HoldCo round status
@@ -98,6 +107,7 @@ The default calendar-first pipeline produces process bias and inverts Marcus's p
 Write to `~/brain/.tasks/briefing-YYYY-MM-DD.md` AND display inline. Sections in this exact order:
 
 1. `# Sunday Briefing — [Date]`
+1.5. `## Section 0 — Strategic Priority Ledger` — one line per rock (status, what moved / STALE / deadline), then "This week's strategic focus" (1-3 rocks). Comes BEFORE Money in Motion. Update the ledger page after the brief.
 2. `## Money in Motion This Week` — three subsections: HoldCo Subscriptions Live, Fund II LP Active Threads, Financing / NAV Loan
 3. `## Last Week — The Three Things That Mattered` — exactly 3 bullets, 1-2 sentences each
 4. `## This Week — Top 5 Priorities` — ranked Tier 1 > 2 > 3 > 4
@@ -111,6 +121,10 @@ Write to `~/brain/.tasks/briefing-YYYY-MM-DD.md` AND display inline. Sections in
 
 ## Pre-finalisation checklist (mandatory)
 
+- [ ] Priority Ledger read FIRST and reconciled; Section 0 present before Money in Motion
+- [ ] Every Top Priority traces to a ledger rock (or is added as a new rock)
+- [ ] Freshness rule applied; at least one proactive risk/deadline Marcus did not flag surfaced
+- [ ] Ledger page updated after the brief (status, last-moved, change log)
 - [ ] Money-flow pages read BEFORE calendar
 - [ ] Every QO/Pledged LP checked for silence age
 - [ ] `## Money in Motion` is Section 1

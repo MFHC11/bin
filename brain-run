@@ -1123,6 +1123,14 @@ phase_5_gbrain_dream() {
     return 0
   fi
 
+  # KNOWN ISSUE (#1570, gbrain v0.42.1.0, Supabase pooler): the FULL `gbrain
+  # dream` cycle fails its `sync` + `synthesize` phases ("connect() has not been
+  # called") — an in-process FactsQueue microtask disconnects the DB singleton
+  # mid-cycle and those two unwrapped phases don't self-heal. The cycle still
+  # runs the DB phases and stamps cycle_freshness, so this submit is fine for
+  # maintenance, but it does NOT produce dream synthesis reflections. For
+  # reliable sync/synthesize output, run them STANDALONE: `gbrain dream --phase
+  # synthesize`. See ~/brain/concepts/dream-cycle-sync-synthesize-1570.md
   local params
   params=$(printf '{"cmd":"%s dream --json","cwd":"%s"}' "$GBRAIN_BIN" "$BRAIN_DIR")
 

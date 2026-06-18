@@ -1,0 +1,32 @@
+#!/bin/zsh
+# gbrain-agentic — gbrain wrapper that scopes secrets.env (incl. ANTHROPIC_API_KEY)
+# to this invocation only.
+#
+# Use for subagent / agentic workflows (gbrain dream, gbrain agent run,
+# gbrain autopilot, gbrain think, etc.) where Anthropic direct-API access
+# is needed.
+#
+# Plain `gbrain` stays key-free so Max-plan routing isn't undermined by
+# a globally-exported ANTHROPIC_API_KEY.
+#
+# Usage: gbrain-agentic <subcommand> [args...]
+#   e.g. gbrain-agentic dream
+#        gbrain-agentic agent run ...
+#        gbrain-agentic doctor
+
+set -u
+SECRETS_FILE="${GBRAIN_SECRETS_FILE:-$HOME/.gbrain/secrets.env}"
+
+if [[ ! -f "$SECRETS_FILE" ]]; then
+  print -ru2 -- "gbrain-agentic: secrets file not found at $SECRETS_FILE"
+  print -ru2 -- "gbrain-agentic: run ~/bin/gbrain-export-secrets.sh to regenerate."
+  exit 2
+fi
+
+# Source within a subshell-style allexport block so only this process tree sees the keys.
+set -a
+# shellcheck disable=SC1090
+source "$SECRETS_FILE"
+set +a
+
+exec gbrain "$@"

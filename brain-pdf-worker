@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# brain-pdf-worker — drain ~/brain/inbox/*.pdf through pdf-to-brain.
+#
+# Launched DETACHED by brain-daily.sh (step 6) AFTER the daily run, so big decks
+# don't block the cron. Each PDF becomes a rich sources/ page (mostly-text PDFs
+# take the cheap pymupdf4llm path; chart decks take the vision pipeline) and the
+# source PDF is moved to sources/pdf/. The pages are NOT synced here — they are
+# ingested by the NEXT daily's `gbrain sync` (≈24h later), per design.
+#
+# Properties:
+#   - Sequential (one PDF at a time) to bound concurrent Claude sessions.
+#   - Idempotent: pdf-to-brain skips an unchanged PDF (content_hash) and moves
+#     processed PDFs out of inbox/, so re-runs never double-process.
+#   - Self-healing: a PDF stays in inbox/ until it succeeds, so a killed/partial
+#     run is simply re-drained by the next daily.
+#   - Safe to run manually anytime: `~/bin/brain-pdf-worker`
+set -u
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+
+INBOX="$HOME/brain/inbox"
+LOGDIR="$HOME/.gbrain/cron"; mkdir -p "$LOGDIR"
+LOG="$LOGDIR/pdf-to-brain-$(date -u +%Y-%m-%d).log"
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+shopt -s nullglob
+pdfs=( "$INBOX"/*.pdf )
+shopt -u nullglob
+
+if [ ${#pdfs[@]} -eq 0 ]; then
+    echo "[$(ts)] pdf-worker: no inbox PDFs" >> "$LOG"
+    exit 0
+fi
+
+echo "[$(ts)] pdf-worker: draining ${#pdfs[@]} inbox PDF(s)" >> "$LOG"
+rc=0
+for pdf in "${pdfs[@]}"; do
+    [ -f "$pdf" ] || continue
+    echo "[$(ts)] → $(basename "$pdf")" >> "$LOG"
+    if "$HOME/bin/pdf-to-brain" "$pdf" >> "$LOG" 2>&1; then
+        echo "[$(ts)]   ✓ done" >> "$LOG"
+    else
+        echo "[$(ts)]   ✗ failed (rc=$?) — left in inbox for next run" >> "$LOG"
+        rc=1
+    fi
+done
+echo "[$(ts)] pdf-worker: complete (rc=$rc)" >> "$LOG"
+exit "$rc"

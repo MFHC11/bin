@@ -10,6 +10,9 @@ LOG_FILE="$HOME/.gbrain/sync.log"
 export PATH="$BUN_PATH:$HOME/.local/bin:$PATH"
 source ~/.zshrc
 
+# Strip stale shell env — gbrain reads its own config from ~/.gbrain/
+unset DATABASE_URL
+
 mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 

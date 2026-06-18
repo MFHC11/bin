@@ -117,12 +117,16 @@ below. The structure is rigid; the content is calibrated to the LP.
   (e.g. a news hook, an article they responded to, a referral)
 
 ### Section 2 — Fund II top line (1 short paragraph)
-- Anchor: Centrica (FTSE-100, British Gas parent), $13.5M LOI signed
+- Anchor: **a FTSE-100 energy company**, $13.5M LOI signed. **HARD RULE
+  (2026-06-18): never name the anchor (Centrica) to anyone without Marcus's
+  explicit per-recipient approval.** "British Gas parent" / "British Gas"
+  also identify it and are equally forbidden. Use only the generic
+  descriptor "a FTSE-100 energy company". This holds regardless of LP
+  stage (committed, in DD, or cold). If the user explicitly confirms the
+  name is cleared for a specific recipient, you may use it for that draft only.
 - Co-investors: Bidra ($1M re-up, Fund I corporate), $10M US SMA
 - First close: **30 June 2026**, target $50M, second close +2–3 months
   at 4% equalisation
-- Calibrate naming: if LP is already past first meeting, name Centrica
-  by name; if cold or pre-meeting, use "FTSE-100 energy company"
 
 ### Section 3 — Fund II forward pipeline (1 short paragraph)
 - Sector-level mapping calibrated to the LP's stated thesis
@@ -143,13 +147,17 @@ below. The structure is rigid; the content is calibrated to the LP.
 
 Cover the four current winners. Wording template (apply corrections):
 
-- **Green Li-ion**: Atoka plant live 24/5 on 99% Li₂CO₃; Tesla, EcoPro,
-  Interco and US DoD validating offtake quality; $12M of signed machine
-  sales into the Middle East with revenue share in the contracts;
+- **Green Li-ion**: modular plants turning spent lithium-ion batteries
+  into battery-grade **precursor cathode active material (pCAM)** and
+  lithium chemicals; Atoka plant live 24/5 on 99% Li₂CO₃; **blue-chip
+  automotive and cathode-producer offtakers validating quality (do NOT
+  name specific offtakers — commercially sensitive)**; $12M of signed
+  machine sales into the Middle East with revenue share in the contracts;
   pre-IPO now (Moelis + Ord Minnett) into an ASX listing
   late-2026 / early-2027.
-- **Anthro**: $15M of revenue, c.$8M from product sales, plus a further
-  $7.5M DoE grant on top of the $42M of non-dilutive support already won.
+- **Anthro**: **revenue generating (exact revenue is commercially
+  sensitive — never cite figures)**, plus a further $7.5M DoE grant on
+  top of the $42M of non-dilutive support already won.
 - **Immaterial**: closed **£14.5M / $20M Series A2** with UBE coming
   in as new corporate strategic and JERA upsizing — joining
   ArcelorMittal in the corporate consortium.
@@ -199,8 +207,9 @@ NEVER use "looking forward to hearing from you."
 
 - First-person ("we" / "I"), contractions OK
 - Named third parties UNEXPLAINED (Sanmina, Vattenfall, UBE,
-  ArcelorMittal, Moelis, Ord Minnett, British Land, Centrica, JERA, GM,
-  CATL, DoE) — assume sophisticated reader
+  ArcelorMittal, Moelis, Ord Minnett, British Land, JERA, GM,
+  CATL, DoE) — assume sophisticated reader. **NOTE: the Fund II anchor
+  (Centrica) is the exception — never name it; see Section 2 hard rule.**
 - Specific dates, even when soft ("30 June 2026", "late-2026 / early-2027",
   "next event")
 - No headers in the body; the structure is paragraph + bullets only
@@ -222,13 +231,17 @@ Walk the checklist:
 4. **Close audit** — close pulled from the actual meeting note; not a
    template default.
 5. **Naming audit** — third parties not explained; no parenthetical
-   introductions ("X, which is a Y").
+   introductions ("X, which is a Y"). **Anchor-confidentiality check:
+   scan the body for "Centrica", "British Gas", or "British Gas parent"
+   and replace with "a FTSE-100 energy company" unless the user has
+   cleared the name for this specific recipient.**
 6. **Voice audit** — no jargon, no MOIC, no "we're working on", no
    "exploring", no "in discussions".
 7. **Length audit** — body should be 250–400 words. Tighten if longer.
 8. **Corrections audit** — Blixt = EIC €6.5M, Immaterial Series A2 =
    £14.5M / $20M with UBE+JERA additions, Anthro = $15M revenue / $8M
-   product, Centrica = $13.5M.
+   product, anchor = $13.5M (anchor named only as "a FTSE-100 energy
+   company"; Centrica name withheld per Section 2 hard rule).
 
 ---
 

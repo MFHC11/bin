@@ -215,7 +215,32 @@ else
     heartbeat inbox-enrich skipped "{\"reason\":\"$REASON\"}"
 fi
 
-# ─── 6. pdf-to-brain: async drain of inbox PDFs ───────────────────────────────
+# ─── 6. Git backup: commit + push + Supabase sync (verified) ──────────────────
+#
+# Single best-practice backup engine: ~/bin/brain-backup. It stages with a >95MB
+# guard, commits, pushes (auto-purges a large-file block from unpushed history
+# and retries — the 219MB-zip remedy), re-syncs Supabase, and verifies that
+# HEAD == origin/main and the gbrain checkpoint == HEAD. Runs here, after enrich
+# and before the detached pdf drain, so this run's enrichment edits are committed,
+# pushed AND synced in the same pass. Never aborts the daily.
+# Authoritative process + skill: concepts/brain-backup-process; ~/bin/skills/brain-backup.
+
+BACKUP="$HOME/bin/brain-backup"
+if [ -x "$BACKUP" ]; then
+    log "→ git-backup: ~/bin/brain-backup --auto"
+    if "$BACKUP" --auto --reason "brain-daily ${DATE_TAG}" >> "$LOG_FILE" 2>&1; then
+        heartbeat git-backup ok '{"engine":"brain-backup","verified":true}'
+        log "  ✓ git-backup: committed, pushed, synced and verified"
+    else
+        heartbeat git-backup error '{"engine":"brain-backup"}'
+        log "  ✗ git-backup: brain-backup reported a failure (see log)"
+    fi
+else
+    log "→ git-backup: SKIP (~/bin/brain-backup not executable)"
+    heartbeat git-backup skipped '{"reason":"no-brain-backup"}'
+fi
+
+# ─── 7. pdf-to-brain: async drain of inbox PDFs ───────────────────────────────
 #
 # Convert any PDFs sitting in inbox/ into rich sources/ pages, AFTER this daily
 # run, as a DETACHED background job so big decks (≈1 min/vision page) don't block

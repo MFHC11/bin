@@ -160,7 +160,7 @@ original Step 9 of the prompt).
 `brain-run --weekly --no-mail --no-granola` (or equivalent inbox-only
 mode). Auto-scaling applies.
 
-**Daily 9 AM cron**: `~/bin/brain-daily-9am.sh` continues to call
+**Daily 5 PM cron**: `~/bin/brain-daily.sh` continues to call
 `claude --print < ~/bin/prompts/inbox-enrich.md` directly. Single-pass
 (≤10 files) — the cron is a daily drip, not a backlog clearer.
 

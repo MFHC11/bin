@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # wispr-sync: pull new Wispr Flow notes from GitHub into ~/brain/inbox/
-# Matches the pattern in brain-daily-9am.sh: set -u (not -e), JSONL heartbeat,
+# Matches the pattern in brain-daily.sh: set -u (not -e), JSONL heartbeat,
 # tee-to-shared-log. Dedup state stored at ~/.gbrain/integrations/wispr-notes/state.json.
 
 set -u
