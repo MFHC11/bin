@@ -7,7 +7,7 @@ metadata:
   originSessionId: 7b821414-cf93-4b6d-81e0-5276e3a84f0f
 ---
 
-Backing up the brain is ONE command, `~/bin/brain-backup` — it stages (guarding out >95MB files), commits, pushes to GitHub, syncs Supabase (`gbrain sync` + `embed --stale`), and verifies (tree clean, no oversize blob in un-backed-up history, HEAD == origin/main, gbrain checkpoint == HEAD). `~/bin/brain-backup --check` is the verify-only self-test. The daily (`~/bin/brain-daily.sh` step 6) calls it automatically.
+Backing up the brain is ONE command, `~/bin/brain-backup`. It protects all three things needed to rebuild after disk loss: (1) brain content → GitHub + Supabase, (2) scripts/skills → the `~/bin` GitHub repo, (3) the Claude memory store → a snapshot inside `~/bin/claude-brain-memory/` (with RESTORE.md) that rides the bin repo (no `gh` installed, so no separate repo). It stages (guarding out >95MB files), commits, pushes, syncs Supabase (`gbrain sync` + `embed --stale`), and verifies (trees clean, no oversize blob in un-backed-up history, both repos HEAD == origin/main, gbrain checkpoint == HEAD, memory snapshot matches live). `~/bin/brain-backup --check` is the verify-only self-test. The daily (`~/bin/brain-daily.sh` step 6) calls it automatically.
 
 **Why:** Marcus explicitly does not want to specify mechanics (commit/push/sync) and worries he'll ask for something he doesn't understand. He wants the correct best-practice process done automatically, asked about in plain language, with tests that catch and self-heal errors. A 219MB `inbox/Prosemino chat.zip` once silently blocked the push for 50+ commits — exactly the kind of failure the engine now prevents and remediates.
 

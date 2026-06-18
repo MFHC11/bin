@@ -7,6 +7,8 @@ description: Back up the brain end-to-end (commit, push to GitHub, sync Supabase
 
 One safe, best-practice process to back up Marcus's brain. Marcus must never have to specify git/push/Supabase mechanics, and you must never ask him about them. He says "back up the brain" (or similar) and you run the verified process.
 
+It protects everything needed to rebuild after disk loss: the brain content (GitHub + Supabase), the scripts/skills (`~/bin` repo on GitHub), and the Claude memory store (snapshotted into `~/bin/claude-brain-memory/`, which rides the bin repo, since `gh` is not installed to give it its own repo).
+
 ## Triggers
 
 "back up the brain", "ready to back up", "save the brain", "backup brain", "is the brain backed up", "make sure the brain is saved/backed up to GitHub", or any request to persist/secure brain work.
