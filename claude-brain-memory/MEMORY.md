@@ -21,6 +21,7 @@
 - [Attio-sourced person stubs can have a wrong auto-merged identity](reference_attio_stub_identity_pollution.md) — right email, someone else's LinkedIn/description + junk aliases; verify before enriching
 - [brain-sync "0 new pages indexed" can be misleading](feedback_brain_sync_zero_pages_indexed.md) — pages may still be ingested; verify with get_page/get_backlinks, not the counter
 - [ERV core messaging: "energy tech VC" + "electrification"](feedback_erv_core_messaging.md) — never "electrochemistry"; the erv-fund-ii/fund-ii-summary/marcus-clover brain pages are stale on this
+- [ERV + Prosemino portfolio one-liners (Marcus's voice)](reference_erv_portfolio_one_liners.md) — canonical presentable descriptions at concepts/erv-portfolio-overview; Oort=SAF (not H2), Ecolectro=membranes/ionomers, benefit-led, no distress
 - [Telegram chat ingest pattern](project_telegram_chat_ingest_pattern.md) — splitter + tiered fleet, no stubs; entity map curation is the governor step
 - [No em dashes in any writing for Marcus](feedback_no_em_dashes.md) — use comma/colon/parens; rule embedded in skill prompts + CLAUDE.md; copy into writing-subagent prompts
 - [Prompt-injection: open security item](project_prompt_injection_open_item.md) — brain ingest has no injection defence; ranked fix plan written, not yet applied
