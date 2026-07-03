@@ -148,6 +148,43 @@ def format_time(iso_str: str | None) -> str:
 
 ATTENDEE_BLOCKLIST = ("@resource.calendar.google.com", "@group.calendar.google.com")
 
+# Attendee -> people-page resolution (added 2026-07-03, calendar-history plan
+# phase 3c). Conservative: only unambiguous full-name/email keys resolve, so a
+# bare "Chris" never links. Marcus's own page is excluded to keep backlinks
+# meaningful.
+_PEOPLE_MAP: dict[str, str] | None = None
+
+
+def _people_map() -> dict[str, str]:
+    global _PEOPLE_MAP
+    if _PEOPLE_MAP is None:
+        m: dict[str, set] = {}
+        for f in (BRAIN / "people").glob("*.md"):
+            slug = "people/" + f.stem
+            if slug == "people/marcus-clover":
+                continue
+            try:
+                head = f.read_text(errors="ignore")[:2000]
+            except OSError:
+                continue
+            keys = []
+            t = re.search(r"^title:\s*(.+)$", head, re.M)
+            if t:
+                keys.append(t.group(1).strip().strip('"'))
+            e = re.search(r"^email:\s*(\S+@\S+)\s*$", head, re.M)
+            if e:
+                keys.append(e.group(1).strip().strip('"'))
+            a = re.search(r"^aliases:\s*\[(.*?)\]", head, re.M | re.S)
+            if a:
+                keys += [x.strip().strip('"').strip("'") for x in a.group(1).split(",")]
+            for k in keys:
+                k = k.strip().lower()
+                if k:
+                    m.setdefault(k, set()).add(slug)
+        _PEOPLE_MAP = {k: next(iter(v)) for k, v in m.items()
+                       if len(v) == 1 and (" " in k or "@" in k) and len(k) >= 6}
+    return _PEOPLE_MAP
+
 
 def filter_attendees(attendees: list[dict]) -> list[str]:
     out = []
@@ -166,7 +203,9 @@ def filter_attendees(attendees: list[dict]) -> list[str]:
         if name and name.startswith("YC-SF-"):
             continue
         if name:
-            out.append(name)
+            pm = _people_map()
+            slug = pm.get(email) or pm.get(name.strip().lower())
+            out.append(f"[[{slug}|{name}]]" if slug else name)
     return out
 
 
