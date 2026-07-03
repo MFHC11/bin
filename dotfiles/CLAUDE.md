@@ -139,3 +139,15 @@ genuine scope changes — never for cost or model choice.
 - Source PDF moves to `sources/pdf/` (gitignored). Stages for next brain-sync; pass --sync to ingest immediately
 - Useful flags: --dry-run (route table, no calls), --pages 3,11-16 / --sample N (test subset → writes .SAMPLE.md), --concurrency N, --force
 - Ledger: ~/brain/.tasks/skill-evolution/pdf-to-brain/ledger.jsonl (auto-appended by the script)
+
+## LP QUARTERLY REPORT SKILL (added 2026-07-02)
+- Always use ~/bin/skills/lp-quarterly-report/SKILL.md for ERV Fund I Company Updates and ERV Group Shareholder Updates (quarterly LP/board/shareholder reporting)
+- Triggers: "LP report", "quarterly update/report", "company update QX", "shareholder update", "draft the <portco> entry for the quarterly"
+- Authoritative instructions: ~/bin/prompts/lp-quarterly-report.md (read fresh each run); codified 2026-07-02 from the 11 historical reports, supersedes the Claude cowork project instruction set
+- Core discipline: DELTA REPORTING (read the prior quarter's entry first, lead with what changed, close every loop the prior quarter opened, stale-sentence test: cut anything that could have run last quarter unchanged)
+- Brain-first pipeline per company (companies/<slug> page, then board minutes/meetings in quarter, then inbox emails in quarter, then recall(entity), then lp-follow-up-email-corrections.md) replaces asking Marcus for raw notes; gaps flagged inline [CONFIRM: ...], never fabricated
+- This genre REPORTS to committed investors (includes MOIC/NAV, runway dates, distress candour): the OPPOSITE of lp-follow-up-email, which sells and strips those
+- Naming: name customers/offtakers/closed-round investors; genericise investors in live unclosed rounds ("a Middle East family office"); anchor confidentiality still applies (never Centrica in any form, "a FTSE-100 energy company")
+- Output: ~/brain/drafts/lp-quarterly-reports/YYYY-MM-DD-qX-<year>-<scope>.md with working notes (delta table, loops closed, CONFIRM list, sources, deliberately-omitted list)
+- Ledger: ~/brain/.tasks/skill-evolution/lp-quarterly-report/ledger.jsonl
+- Human-initiated only — no cron, no automation
