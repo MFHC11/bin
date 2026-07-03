@@ -32,3 +32,4 @@
 - [Cold LP outreach from Attio + fit_8=Cold is noisy](project_cold_lp_outreach_attio.md) — Attio "LP Fundraising" list; Cold≠never-contacted (warm-parked leads), individuals mis-typed as companies; canary + offset-sliced parallel writers
 - [Inbox-enrich needs Max OAuth token, not API key](project_inbox_enrich_max_oauth.md) — console account is unfunded by design; "Credit balance too low" = missing CLAUDE_CODE_OAUTH_TOKEN; setup-token must run in a real terminal
 - [LP quarterly reporting is now a skill](project_lp_quarterly_report_skill.md) — ~/bin/skills/lp-quarterly-report, codified 2026-07-02 from 11 historical reports; delta discipline + brain-first; REPORTS (incl MOIC/distress), opposite of lp-follow-up-email
+- [Workflow args can arrive stringified — hardcode script constants](feedback_workflow_args_stringified.md) — undefined args made a fan-out silently run 0 of 32 batches; validate args or bake in literals; check processed counts vs expected total
