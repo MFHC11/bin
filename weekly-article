@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# weekly-article — run the weekly article-drafting loop.
+#
+#   weekly-article              interactive: launches a claude session primed with
+#                               the loop prompt; step (b) waits for Marcus's pick.
+#   weekly-article --headless   unattended: claude --print, auto-picks the top idea
+#                               and explains why in the draft's working notes.
+#                               Suitable for cron/launchd later.
+#   weekly-article --dry-run    print the exact invocation, run nothing.
+#
+# Contract: ~/bin/prompts/weekly-article.md (loop) + ~/bin/skills/article-persona/
+# SKILL.md (voice + critic). Output: ~/brain/drafts/articles/. Ledger:
+# ~/brain/.tasks/skill-evolution/weekly-article/ledger.jsonl.
+#
+# NOTE on headless auth (2026-07-03): claude --print from cron needs a valid
+# CLAUDE_CODE_OAUTH_TOKEN in ~/.gbrain/secrets.env (keychain is unreadable from
+# cron) and --permission-mode bypassPermissions. The brain MCP server may be absent
+# headless; the prompt instructs fallback to the gbrain CLI.
+
+set -u
+export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+export GBRAIN_DISABLE_DIRECT_POOL=1
+SECRETS="$HOME/.gbrain/secrets.env"
+[ -r "$SECRETS" ] && . "$SECRETS"
+
+PROMPT_FILE="$HOME/bin/prompts/weekly-article.md"
+LOG_DIR="$HOME/.gbrain/cron"
+mkdir -p "$LOG_DIR" "$HOME/brain/drafts/articles" \
+         "$HOME/brain/.tasks/skill-evolution/weekly-article"
+
+MODE="interactive"
+DRY=0
+for arg in "$@"; do
+    case "$arg" in
+        --headless) MODE="headless" ;;
+        --dry-run)  DRY=1 ;;
+        *) echo "unknown flag: $arg (use --headless / --dry-run)" >&2; exit 2 ;;
+    esac
+done
+
+if [ ! -r "$PROMPT_FILE" ]; then
+    echo "weekly-article: prompt file missing: $PROMPT_FILE" >&2
+    exit 1
+fi
+
+if [ "$MODE" = "headless" ]; then
+    LOG_FILE="$LOG_DIR/weekly-article-$(date -u +%Y-%m-%d-%H%M).log"
+    # MODE marker line first, then the full contract; the prompt file defines how
+    # headless degrades (auto-pick top idea, rationale into working notes).
+    INPUT="MODE: headless
+$(cat "$PROMPT_FILE")"
+    if [ "$DRY" -eq 1 ]; then
+        echo "[dry-run] would run: claude --print --permission-mode bypassPermissions <prompt+MODE:headless> >> $LOG_FILE"
+        exit 0
+    fi
+    echo "weekly-article headless run, log: $LOG_FILE"
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+        (unset ANTHROPIC_API_KEY; printf '%s' "$INPUT" | \
+            claude --print --permission-mode bypassPermissions) >> "$LOG_FILE" 2>&1
+    else
+        printf '%s' "$INPUT" | \
+            claude --print --permission-mode bypassPermissions >> "$LOG_FILE" 2>&1
+    fi
+    RC=$?
+    if [ $RC -eq 0 ]; then
+        echo "done. Draft (if produced) is in ~/brain/drafts/articles/; see log for the pick rationale."
+    else
+        echo "weekly-article headless FAILED (rc=$RC). See $LOG_FILE" >&2
+    fi
+    exit $RC
+fi
+
+# Interactive: prime a live session with the loop. Marcus confirms the pick at (b).
+KICKOFF="Run the weekly article loop now, interactively. Read ~/bin/prompts/weekly-article.md fresh and follow it exactly, pausing for my confirmation at step (b)."
+if [ "$DRY" -eq 1 ]; then
+    echo "[dry-run] would run: claude \"$KICKOFF\" (interactive session)"
+    exit 0
+fi
+exec claude "$KICKOFF"

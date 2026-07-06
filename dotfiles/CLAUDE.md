@@ -151,3 +151,14 @@ genuine scope changes — never for cost or model choice.
 - Output: ~/brain/drafts/lp-quarterly-reports/YYYY-MM-DD-qX-<year>-<scope>.md with working notes (delta table, loops closed, CONFIRM list, sources, deliberately-omitted list)
 - Ledger: ~/brain/.tasks/skill-evolution/lp-quarterly-report/ledger.jsonl
 - Human-initiated only — no cron, no automation
+
+## WEEKLY ARTICLE SKILL (added 2026-07-03)
+- Always use ~/bin/skills/weekly-article/SKILL.md for the weekly article-drafting loop; voice + critic contract in ~/bin/skills/article-persona/SKILL.md (ANY public writing in Marcus's voice must go through article-persona, including ad-hoc "draft a post" asks)
+- Triggers: "weekly article", "article loop", "what should I write this week", "draft this week's post/blog", "draft an article/LinkedIn post" (persona skill)
+- Authoritative loop instructions: ~/bin/prompts/weekly-article.md (read fresh each run)
+- Backlog: DB-only page concepts/erv-content-ideas (read/write via MCP or gbrain CLI, never filesystem); statuses idea -> drafting -> published; `## Run log` section on that page is the variety guard
+- Rubric: thesis compounding x3, evidence readiness x3, differentiation x2.5, timeliness x2, audience pull x2, low-effort/low-risk x1.5; sequencing: front-load readiness, ~1 tentpole per 2 light pieces, no repeated theme letter two weeks running, retire stale, keep an evergreen fallback
+- Interactive: WAIT for Marcus's pick at step (b). Headless (~/bin/weekly-article --headless): auto-pick top-ranked, rationale into working notes
+- Hard rules: critic pass mandatory before delivery; no em dashes; never invent specifics (placeholders); confidentiality gate (anchor never named, portfolio facts via portfolio-disclosure tiers)
+- Output: ~/brain/drafts/articles/YYYY-MM-DD-<idea-id>-<slug>.md; Ledger: ~/brain/.tasks/skill-evolution/weekly-article/ledger.jsonl
+- Manual for now (Marcus runs it); built scheduler-ready via ~/bin/weekly-article --headless
