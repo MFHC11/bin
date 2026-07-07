@@ -214,7 +214,17 @@ def format_meeting(meeting: dict, transcript: list[str]) -> tuple[str, str]:
 
     tags_json = json.dumps(sorted(set(tag_set)))
 
+    # First 30 utterances only: the page Timeline is a preview (keeps chunks
+    # and embeddings lean). The FULL transcript is written to a sidecar by
+    # main() and referenced below, so the substantive second half of long
+    # calls is never lost (2026-07-07 fix: all three 6 Jul LP calls had their
+    # substance beyond utterance 30 silently discarded).
     timeline_md = "\n".join(f"- {u}" for u in transcript[:30]) if transcript else "_(transcript not available)_"
+    if transcript and len(transcript) > 30:
+        timeline_md += (
+            f"\n- _(preview: first 30 of {len(transcript)} utterances; "
+            f"full transcript in .transcripts/{Path(filename).stem}.txt)_"
+        )
 
     body = f"""---
 type: meeting
@@ -272,6 +282,14 @@ def main():
             # Filename collision (rare; same date+slug): append note_id suffix
             path = TARGET_DIR / f"{path.stem}-{note_id[:8]}.md"
         path.write_text(body)
+        # Sidecar: persist the FULL transcript so long calls keep their
+        # substance (the page Timeline holds only a 30-utterance preview).
+        if transcript and len(transcript) > 30:
+            sidecar_dir = TARGET_DIR / ".transcripts"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            (sidecar_dir / f"{path.stem}.txt").write_text(
+                "\n".join(transcript) + "\n"
+            )
         mark_imported(note_id)
         imported += 1
 
