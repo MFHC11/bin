@@ -152,6 +152,20 @@ for _attempt in 1 2 3; do
 done
 [ "$EXTRACT_OK" -eq 1 ] || log "  ✗ extract failed after 3 attempts"
 
+# Repair pass (2026-07-07): re-insert wikilink edges the extractor drops.
+# Two upstream gbrain bugs: (1) addLinksBatch text[] encoding breaks on
+# contexts with embedded quotes and silently loses the whole 100-row batch;
+# (2) the extractor's DIR_PATTERN whitelist omits daily/, inbox/, sources/,
+# signals/ etc, so the calendar index chain never links. Server-side
+# INSERT..SELECT, idempotent. Details: ~/bin/brain-link-backfill header.
+LINK_BACKFILL="$HOME/bin/brain-link-backfill"
+if [ -x "$LINK_BACKFILL" ]; then
+    log "→ link-backfill: repairing dropped wikilink edges"
+    "$LINK_BACKFILL" >> "$LOG_FILE" 2>&1 \
+        && log "  ✓ link-backfill done" \
+        || log "  ✗ link-backfill failed (see log)"
+fi
+
 # ─── 5. inbox-enrich subagent (Sonnet) ────────────────────────────────────────
 
 # Canonical instruction set: ~/bin/prompts/inbox-enrich.md

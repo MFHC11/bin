@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# brain-link-backfill — server-side repair for wikilink edges the gbrain
+# extractor drops.
+#
+# Why this exists (2026-07-07 audit):
+#   1. gbrain extract's addLinksBatch serialises link contexts into a
+#      Postgres text[] client-side; contexts containing embedded quotes
+#      produce "malformed array literal" and the WHOLE 100-row batch is
+#      lost (console-only error, exit code still 0). ~23 batches/run were
+#      dying on calendar day-page links.
+#   2. gbrain's link extractor has a hardcoded directory whitelist
+#      (DIR_PATTERN in core/link-extraction.ts) that omits daily/, inbox/,
+#      sources/, signals/, drafts/, wiki/, deals/ — wikilinks targeting
+#      those namespaces are never extracted, which defeats the calendar
+#      master->year->month->day de-orphaning chain built on 2026-07-03.
+#
+# This script inserts the missing edges with a single server-side
+# INSERT ... SELECT (no client-side array marshalling, so no escaping bug).
+# It is idempotent: it only inserts (from,to) pairs with NO existing edge
+# of any type, and carries ON CONFLICT DO NOTHING as a second guard.
+# Convention: link_type='mentions', link_source='markdown', origin NULL —
+# matching what the extractor itself writes for body wikilinks.
+#
+# Scope: path-form wikilinks ([[ns/slug]] / [[ns/slug|alias]] / [[ns/slug#sec]])
+# between live (non-deleted) pages in the same source. Name-form wikilinks
+# ([[Centrica]]) are left to the extractor's resolver.
+#
+# Called from brain-daily.sh after `gbrain extract`; safe to run manually.
+# Remove once upstream gbrain fixes both bugs (check CHANGELOG on update).
+
+set -euo pipefail
+
+SECRETS_FILE="$HOME/.gbrain/secrets.env"
+[ -r "$SECRETS_FILE" ] && . "$SECRETS_FILE"
+
+if [ -z "${DATABASE_URL:-}" ]; then
+    echo "brain-link-backfill: DATABASE_URL not set" >&2
+    exit 1
+fi
+
+CREATED=$(psql "$DATABASE_URL" -t -A <<'SQL'
+WITH refs AS (
+  SELECT p.id AS from_id, p.source_id AS from_source,
+         trim((regexp_matches(
+           coalesce(p.compiled_truth,'') || E'\n' || coalesce(p.timeline,''),
+           '\[\[([^|\]#]+/[^|\]#]+?)\s*[|\]#]', 'g'))[1]) AS tslug
+  FROM pages p
+  WHERE p.deleted_at IS NULL
+),
+missing AS (
+  SELECT DISTINCT r.from_id, tp.id AS to_id
+  FROM refs r
+  JOIN pages tp ON tp.slug = r.tslug
+                AND tp.source_id = r.from_source
+                AND tp.deleted_at IS NULL
+  LEFT JOIN links l ON l.from_page_id = r.from_id AND l.to_page_id = tp.id
+  WHERE l.id IS NULL AND r.from_id <> tp.id
+)
+INSERT INTO links (from_page_id, to_page_id, link_type, context, link_source)
+SELECT from_id, to_id, 'mentions', '', 'markdown'
+FROM missing
+ON CONFLICT (from_page_id, to_page_id, link_type, link_source, origin_page_id) DO NOTHING
+RETURNING 1;
+SQL
+)
+
+COUNT=$(echo "$CREATED" | grep -c 1 || true)
+echo "brain-link-backfill: inserted $COUNT missing wikilink edges"
