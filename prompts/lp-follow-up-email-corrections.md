@@ -4,7 +4,7 @@ User-verified figures and overrides for the `lp-follow-up-email` skill. On any
 conflict with the brain, **this file wins**. Update this file when figures
 change or when a new portco / deal needs canonical phrasing.
 
-Last updated: 2026-06-18
+Last updated: 2026-07-07
 
 > **⛔ ANCHOR CONFIDENTIALITY (added 2026-06-18, hard rule).** The Fund II
 > anchor's name — **Centrica** — must NOT be disclosed to anyone without
@@ -40,7 +40,8 @@ Use when the recipient must not be solicited for a fund commitment (e.g. corpora
   **never named externally without per-recipient approval** (see ANCHOR
   CONFIDENTIALITY rule at top of file). Do not write "Centrica", "British
   Gas", or "British Gas parent" in any LP-facing output.
-- Anchor LOI size: **$13.5M** (signed 26 April 2026)
+- Anchor LOI size: **c.$13M** (Marcus adjudication 2026-07-07; the commitment
+  is GBP 10M and the earlier "$13.5M" was an early-FX conversion, do not use)
 - First close date: **30 June 2026**
 - Target fund size: **$50M**
 - Second close: 2–3 months after first close, **4% equalisation**
