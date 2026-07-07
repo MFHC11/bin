@@ -38,6 +38,18 @@ if [ -z "${DATABASE_URL:-}" ]; then
     exit 1
 fi
 
+# brain-daily.sh exports a restricted PATH that omits Homebrew; resolve psql
+# explicitly so the repair step works under cron (2026-07-07 fix).
+PSQL="$(command -v psql || true)"
+for cand in /opt/homebrew/bin/psql /usr/local/bin/psql /Applications/Postgres.app/Contents/Versions/latest/bin/psql; do
+    [ -n "$PSQL" ] && break
+    [ -x "$cand" ] && PSQL="$cand"
+done
+if [ -z "$PSQL" ]; then
+    echo "brain-link-backfill: psql not found" >&2
+    exit 1
+fi
+
 CREATED=$(psql "$DATABASE_URL" -t -A <<'SQL'
 WITH refs AS (
   SELECT p.id AS from_id, p.source_id AS from_source,
