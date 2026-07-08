@@ -162,3 +162,12 @@ genuine scope changes — never for cost or model choice.
 - Hard rules: critic pass mandatory before delivery; no em dashes; never invent specifics (placeholders); confidentiality gate (anchor never named, portfolio facts via portfolio-disclosure tiers)
 - Output: ~/brain/drafts/articles/YYYY-MM-DD-<idea-id>-<slug>.md; Ledger: ~/brain/.tasks/skill-evolution/weekly-article/ledger.jsonl
 - Manual for now (Marcus runs it); built scheduler-ready via ~/bin/weekly-article --headless
+
+## TASTE INDEX (added 2026-07-08)
+- A gated, structured record of Marcus's judgment (what is good, why, and what to avoid) that skills read before producing work. Hub: `concepts/taste-index`; first domain: `concepts/taste-writing`. Principle: no signal, no storage; twenty strong captures beat two thousand weak notes.
+- Capture trigger: `+taste` / "save as taste" / "this is taste" (something Marcus likes), or `+anti` (an anti-pattern to avoid). Routed through ~/bin/skills/taste-capture/SKILL.md. Nothing enters the index without an explicit signal; the dream cycle and daily may AUDIT taste but must never AUTHOR it.
+- Three buckets, routed by how the judgment is retrieved: (1) always-on cross-domain rules -> memory feedback file (auto-loads via MEMORY.md), e.g. no em dashes, anchor confidentiality; (2) domain taste -> `concepts/taste-<domain>` (writing live; deals, lp-comms, product, design to come), read at point-of-work by that domain's skill; (3) calibratable calls -> gbrain takes (kind=bet) with a resolve-by date, scored by the calibration scorecard (empty as of 2026-07-08, calibration deferred).
+- Capture shape: What I liked / Why it matters / Anti-pattern / How to apply / Domain-Tags / Reference (+ Confidence and Revisit-by for bets). "Why it matters" and "How to apply" are load-bearing; a capture without them is a bookmark, not taste.
+- article-persona reads `concepts/taste-writing` before every draft (canonical home of writing rulings; latest wins). Other creative skills should read their domain page once it exists.
+- Maintenance: a weekly read-only curator pass (fold into the dream cycle) flags captures missing Why/How-to-apply, domain pages not linked from the hub register, and bets past their resolve date. Silence means healthy.
+- Human-initiated capture only; no cron, no auto-population.

@@ -22,9 +22,15 @@ model_default: frontier (compiled public writing routes frontier per governor ar
 
 # Article Persona
 
-This file is self-contained: voice, screens, and critic pass all live here.
-Read it fresh every drafting run. It is written for the drafting agent, not
-for Marcus.
+This file holds the operational screens: voice, AI-tell screen, and critic
+pass. Read it fresh every drafting run. It is written for the drafting agent,
+not for Marcus.
+
+FIRST, read the canonical taste record: `~/brain/concepts/taste-writing.md`
+(the growing record of Marcus's writing judgment and anti-patterns) and its
+hub `~/brain/concepts/taste-index.md`. Those rulings are binding, the latest
+wins, and they override anything in this skill on conflict. This skill
+enforces; the taste page decides what good is.
 
 ## Voice
 
@@ -136,17 +142,12 @@ The critic logs what it caught and fixed in the working notes ("Critic log")
 so Marcus can see the screen working. A draft is not deliverable until the
 critic pass is clean.
 
-## Marcus taste rulings (dated, binding; latest wins)
+## Marcus taste rulings (canonical home: concepts/taste-writing)
 
-- 2026-07-03, on the rejected P2 draft ("Would this still exist if electrification
-  were complete?"): purity-test or filter-question pieces read as ideological and
-  substance-free. A piece must make a key insight or take a concrete stance, not
-  perform a worldview. Never reduce the thesis to "electrification only".
-- 2026-07-03: the fix he asked for instead: a really vivid, CONCRETE physical
-  argument doing the work (his example: aluminium smelters coasting on furnace
-  thermal mass through price spikes). Prefer one mechanical, checkable, insider
-  example carrying the argument over any abstract framing. Analogies should be
-  physical assets doing physics, not metaphors.
+The dated, binding rulings now live in `~/brain/concepts/taste-writing.md` and
+grow via the `+taste` capture trigger. Read that page at the start of every run
+(see the note under the title above). Latest ruling wins and overrides anything
+in this skill on conflict. Do not maintain a second copy of the rulings here.
 
 ## Red flags (stop and rewrite, do not rationalise)
 
