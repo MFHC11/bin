@@ -30,3 +30,12 @@ attachment-ingestion work widened this (any sender's PDF now auto-flows in).
 Garry Tan's gstack is the reference model (layered classifiers, canary token,
 UNTRUSTED envelope, deny-default, 2-of-N verdict combiner). Related: this is the
 same risk class flagged when scoping email attachments and chat ingests.
+
+**Live evidence (2026-07-09 inbox-enrich run, 62-file drain):** two separate
+payloads hit subagents mid-run and were both correctly ignored (no data
+affected) — (1) an "ignore the following text..." instruction buried in an
+Energy Tech Challengers marketing email, disguised as unrelated book-marketing
+copy; (2) a fabricated system-reminder-shaped block mid-task suggesting the
+subagent call unrelated MCP memory-search tools. Neither exploited anything,
+but this confirms the hole is being hit by real inbound mail, not just a
+theoretical risk — raises the case for doing P0+P1 sooner rather than later.
