@@ -50,7 +50,7 @@ if [ -z "$PSQL" ]; then
     exit 1
 fi
 
-CREATED=$(psql "$DATABASE_URL" -t -A <<'SQL'
+CREATED=$("$PSQL" "$DATABASE_URL" -t -A <<'SQL'
 WITH refs AS (
   SELECT p.id AS from_id, p.source_id AS from_source,
          trim((regexp_matches(
