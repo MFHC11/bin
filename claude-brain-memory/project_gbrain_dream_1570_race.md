@@ -17,5 +17,7 @@ On the Supabase session-pooler brain (gbrain v0.42.1.0, 1280d ZeroEntropy), a fu
 - **No config flag** disables the fire-and-forget drain.
 - The full cycle still stamps `cycle_freshness` on `partial`, so running it for the DB phases is harmless.
 - Gotcha: the progress log prints `[cycle.sync] done` even on failure — "done" = step returned, not succeeded. Only the JSON `status` is authoritative.
+- Gotcha (2026-07-16): standalone `--phase synthesize` OVERWRITES `dream-cycle-summaries/<date>.md` with its own auto-summary ("Children: N failed..."), clobbering any governor-written summary for that date. Write the in-session dream summary AFTER the synthesize re-run, or rewrite it afterward. Its child jobs also still fail on the exhausted gbrain API key (0 pages written), so in-session Max-plan subagents remain the real synthesis path.
+- Confirmed again 2026-07-16: full cycle exit 0 but sync+synthesize failed in-cycle; standalone re-runs both clean (sync 0.6s, synthesize 61.9s).
 
 Full ADR: `~/brain/concepts/dream-cycle-sync-synthesize-1570.md`. Upstream report draft (pending post): `~/brain/.tasks/gbrain-1570-upstream-report.md`. Related: [[feedback_gbrain_update_procedure]], [[feedback_gbrain_ipv6_ddl]], [[project_dream_corpus_choice]].
