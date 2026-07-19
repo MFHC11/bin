@@ -5,6 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: b5395f9c-baf8-436e-b698-a2b89b437f7f
+  modified: 2026-07-19T06:48:15.382Z
 ---
 
 On the Supabase session-pooler brain (gbrain v0.42.1.0, 1280d ZeroEntropy), a full `gbrain dream` cycle returns `status: partial` with **`sync` and `synthesize` always failing** ("No database connection: connect() has not been called"). All later phases succeed.
@@ -19,5 +20,12 @@ On the Supabase session-pooler brain (gbrain v0.42.1.0, 1280d ZeroEntropy), a fu
 - Gotcha: the progress log prints `[cycle.sync] done` even on failure — "done" = step returned, not succeeded. Only the JSON `status` is authoritative.
 - Gotcha (2026-07-16): standalone `--phase synthesize` OVERWRITES `dream-cycle-summaries/<date>.md` with its own auto-summary ("Children: N failed..."), clobbering any governor-written summary for that date. Write the in-session dream summary AFTER the synthesize re-run, or rewrite it afterward. Its child jobs also still fail on the exhausted gbrain API key (0 pages written), so in-session Max-plan subagents remain the real synthesis path.
 - Confirmed again 2026-07-16: full cycle exit 0 but sync+synthesize failed in-cycle; standalone re-runs both clean (sync 0.6s, synthesize 61.9s).
+
+**Update 2026-07-19 (post-upgrade findings):**
+- Upgraded 0.42.1.0 -> 0.42.62.0 (bun re-pin at `f72de97` per [[feedback_gbrain_update_procedure]]); schema migrations 111 -> 123 applied clean via `gbrain init --migrate-only` with `GBRAIN_DISABLE_DIRECT_POOL=1`.
+- After upgrade, standalone `--phase sync` is instant-clean. But standalone `--phase synthesize` now fails with a DIFFERENT error: `[SYNTH_PHASE_FAIL] write CONNECTION_CLOSED aws-0-eu-west-1.pooler.supabase.com:5432` — the pooler drops the socket during the long LLM phase and the final write (writeSummaryPage / verdicts, caught at `src/core/cycle/synthesize.ts` catch ~line 588) has NO retry wrapper. The 0.42.62 reconnect fixes (build-then-swap reconnect, worker reconnect) do not cover this path.
+- Synthesize checkpoints DO converge across retries: run durations 9h17m -> 59min (children persist). Retrying shrinks the exposure window each time.
+- The direct (non-pooler) host `db.<ref>.supabase.co` does not resolve from this machine at all, so the pooler is the only path; do not chase the direct-pool workaround.
+- If synthesize keeps failing at the write: escalate upstream (write-path retry needed in synthesize), don't loop retries beyond convergence.
 
 Full ADR: `~/brain/concepts/dream-cycle-sync-synthesize-1570.md`. Upstream report draft (pending post): `~/brain/.tasks/gbrain-1570-upstream-report.md`. Related: [[feedback_gbrain_update_procedure]], [[feedback_gbrain_ipv6_ddl]], [[project_dream_corpus_choice]].
