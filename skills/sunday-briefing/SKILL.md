@@ -78,6 +78,7 @@ The briefing runs two layers: a **strategic layer** (the Priority Ledger, `conce
 
 The default calendar-first pipeline produces process bias and inverts Marcus's priority hierarchy. **Run in this exact sequence:**
 
+-1. **Gap detection** (2026-07-19): if the last `.tasks/briefing-*.md` is older than 9 days, widen all lookbacks to the full gap and retitle the lookback section "Since the Last Brief (N days)".
 0. **Priority Ledger first** (`concepts/erv-priority-ledger`): reconcile every rock (moved? STALE? deadline within 14 days?). Report in Section 0; write updates back after the brief.
 1. **Money-flow pages first** (read in full, do not search/skim):
    - `companies/invicta-wealth-solutions.md` — every open HoldCo subscription
@@ -144,15 +145,13 @@ Write to `~/brain/.tasks/briefing-YYYY-MM-DD.md` AND display inline. Sections in
 | **Visual weight inverted** | Meeting prep section longer than Money in Motion | Money in Motion is Section 1; meeting prep entries capped 60 words |
 | **30-turn ceiling hit** | Briefing incomplete | Write partial briefing with explicit "incomplete — covered through Step N" header rather than nothing |
 
-## Cost estimate
+## Model routing (governor architecture, 2026-07-19)
 
-- **Sonnet 4.6 (default):** ~$0.30-1.20 per run, depending on inbox volume
-- **Opus 4.7:** ~$1.20-2.00 per run; use for first-of-month or after a documented failure
-- **Cron-triggered (if added):** Sonnet only
+Cost gates are void on Max plan. The governor routes: frontier session model (Opus 4.8 / Fable 5) when run in-session (the brief is compiled judgment); Sonnet acceptable for a future cron run. 2026-07-19 additions: close-critical-path test in Tier 1, portfolio distress radar (step 4.5), capital-channel sweep (step 4.6), Delegable line in Top 5, Compounding section (max 2 lines), mandatory CEO-readable PDF render sent as attachment.
 
 ## Conflict resolution with gbrain default skills
 
-The gbrain repo ships `data-research`, `ingest`, and `meeting-ingestion` skills. Those have different filing rules and synthesis patterns. **`sunday-briefing` wins for any task asking for a weekly synthesis briefing** — do not chain into or substitute the gbrain defaults. The Sunday briefing produces no new brain pages (`writes_pages: false`); it only writes to `.tasks/`.
+The gbrain repo ships `data-research`, `ingest`, and `meeting-ingestion` skills. Those have different filing rules and synthesis patterns. **`sunday-briefing` wins for any task asking for a weekly synthesis briefing** — do not chain into or substitute the gbrain defaults. The Sunday briefing writes to `.tasks/` plus one brain page: `concepts/erv-priority-ledger` (reconciled each run).
 
 ## Invocation patterns
 

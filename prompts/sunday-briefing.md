@@ -28,6 +28,7 @@ If the answer is no, the priorities are wrong. Restructure.
 - NAV loan / financing in execution
 - Fund II LP DDQs or term sheets with deadlines
 - Active LP meetings where dataroom or subscription is the next gate
+- **Close critical path (added 2026-07-19):** regulatory, KYC, and formation steps that GATE the fund close (GFSC application items, subscription and KYC certification chains, LPA/formation docs). These look like "process" but sit on the critical path to money landing; the close-critical-path test is: "if this stalls a week, does the close date move?" If yes, it is Tier 1.
 
 **Tier 2 — Top 3 strategic LP conversations with specific imminent moves**
 
@@ -35,13 +36,15 @@ If the answer is no, the priorities are wrong. Restructure.
 Important but not money this week.
 
 **Tier 4 — Operational / process (IQ-EQ, fund admin, governance)**
-Only surface if blocking Tier 1.
+Only surface if blocking Tier 1. Process that fails the close-critical-path test lives here; process that passes it is Tier 1, not here.
 
-**Hard rule:** Process items NEVER rank above commercial items unless they unblock cash.
+**Hard rule:** Process items NEVER rank above commercial items unless they unblock cash or pass the close-critical-path test.
 
 ## DATA-PIPELINE ORDER (mandatory, in this sequence)
 
 The default calendar-first pipeline produces process bias. Run in this order:
+
+-1. **Gap detection (added 2026-07-19)** — find the most recent `.tasks/briefing-*.md`. If the gap since it exceeds 9 days, widen every "last 7 days" lookback below to cover the full gap, and retitle the lookback section "Since the Last Brief (N days)". A stale ledger is a symptom of a missed cadence, not an excuse: reconcile against reality, and say plainly in Section 0 how long the ledger sat unreconciled.
 
 0. **Priority Ledger first** — read `concepts/erv-priority-ledger` in full. For each rock: did it move since the last reconcile? Is it stalled past its chase cadence (mark STALE)? Is a deadline inside the next 14 days? Note what changed; you will both report this in Section 0 and write updates back to the ledger after the brief.
 1. **Money-flow pages first** (read these in full):
@@ -53,6 +56,8 @@ The default calendar-first pipeline produces process bias. Run in this order:
 3. **tasks/active.md** — read Tier 1 section first
 3.5. **Gmail citations on LP / HoldCo pages (forward-compatible silence check)** — grep for `[Source: [gmail:` on every `companies/lp-*.md`, `companies/invicta-wealth-solutions.md`, and pages tagged `[lp,...]`. For each page, find the most recent gmail-citation date. If that date is 3+ days old AND no later `## Recent Activity` or `## Timeline` entry exists on the page (regardless of source), surface the LP in Inbox Debt with the citation thread-id. This is the post-2026-05-19 successor to the inbox-debt detector; the legacy inbox files in Step 4 cover the 308-file backlog.
 4. **Last 7 days of inbox** — read all files with LP / HoldCo / KYC / DDQ / subscription / NAV in the filename or summary, regardless of recency rank. After 2026-05-19 most new emails won't appear here (they get deleted post-enrichment); the legacy cohort (`legacy-inbox: 2026-05-19`) remains. Read both.
+4.5. **Portfolio distress radar (added 2026-07-19)** — scan the lookback window's meetings/, inbox, and sources/ for portfolio-company stress signals: cancelled board calls, IC pressure, runway language, bridge/down-round mentions, shareholder updates with distress candour. The prompt's own freshness-rule example is a portfolio cash-crunch, so look for one every week. Acute signals go to Top 5 via the freshness rule; simmering ones go to Watch List.
+4.6. **Capital-channel sweep (added 2026-07-19)** — check `drafts/` (lp-follow-up-emails, outreach lists, marketing sends) and any active outreach workstream (e.g. Mexico distribution, cold LP outreach) modified in the lookback window. A channel with an imminent send or decision that has no ledger rock gets added to the ledger and considered for Top 5. Capital channels Marcus built mid-week must not be invisible on Sunday.
 5. **Calendar for next 7 days** — last, after commercial picture is built
 6. **Last 7 days of daily notes** — context only
 7. **Cross-reference attendees against people/companies pages**
@@ -95,6 +100,7 @@ Each priority must trace to a ledger rock (cite Pn) or be a genuinely new item (
 - Why it matters now (commercial weight first, then urgency)
 - Specific action required from Marcus
 - Owner if not Marcus
+- **Delegable (added 2026-07-19):** what the CoS agent will execute on a one-word go (draft the chase, prep the doc, compile the list). If nothing is delegable, omit the line. The brief is leverage, not just a to-do list.
 
 ### ## Owed Responses (Inbox Debt)
 
@@ -135,9 +141,13 @@ Max 5 items, one line each. Portfolio developments, LP movements, ERV operationa
 
 1-3 items. Things that look urgent but aren't, or commitments to push back on.
 
+### ## Compounding (max 2 lines, added 2026-07-19)
+
+One or two lines only: weekly article status (backlog pick or draft in flight) and any thinking thread feeding ERV's public voice (content is LP top-of-funnel, the Mexico update email is built on an article). Never longer than 2 lines; cut it entirely before cutting anything commercial.
+
 ## STYLE RULES
 
-- Total length under 800 words
+- Total length under 850 words
 - No bullet points longer than 2 lines
 - Every meeting prep entry under 60 words
 - No em dashes — use commas or restructure
@@ -161,6 +171,7 @@ Max 5 items, one line each. Portfolio developments, LP movements, ERV operationa
 - [ ] Forcing question: will acting on the top 5 in order move money into ERV faster?
 
 ## WRITE TO
-- `~/brain/.tasks/briefing-YYYY-MM-DD.md` and show inline.
-- Optional: a formatted `~/brain/.tasks/briefing-YYYY-MM-DD.html` when Marcus asks for an HTML / readable version.
+- `~/brain/.tasks/briefing-YYYY-MM-DD.md` (canonical) and show inline.
+- **Mandatory CEO-readable render (added 2026-07-19):** generate a polished PDF from the markdown via the make-pdf skill (`~/.claude/skills/make-pdf`, flags: `--no-confidential --title "Sunday Briefing YYYY-MM-DD"`), save to `~/brain/.tasks/briefing-YYYY-MM-DD.pdf`, and send it to Marcus as a file attachment. The PDF is the delivery format (phone-readable, skimmable, actionable); the markdown is the source of truth. Fall back to a self-contained styled HTML only if make-pdf is unavailable.
 - AFTER showing the brief: write updates back to `concepts/erv-priority-ledger` (status, last-moved, change-log line, new open questions) and re-ingest it via put_page so the ledger stays the live source of truth.
+- Append the run to `~/brain/.tasks/skill-evolution/sunday-briefing/ledger.jsonl`.
