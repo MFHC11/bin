@@ -171,3 +171,12 @@ genuine scope changes — never for cost or model choice.
 - article-persona reads `concepts/taste-writing` before every draft (canonical home of writing rulings; latest wins). Other creative skills should read their domain page once it exists.
 - Maintenance: a weekly read-only curator pass (fold into the dream cycle) flags captures missing Why/How-to-apply, domain pages not linked from the hub register, and bets past their resolve date. Silence means healthy.
 - Human-initiated capture only; no cron, no auto-population.
+
+## PERSONAL ASSISTANT (PA) SKILL (added 2026-07-20)
+- Marcus's accountability nudge, distinct from the chief-of-staff layer: the CoS (Sunday briefing + `concepts/erv-priority-ledger`) sets strategy; the PA makes sure the concrete things Marcus said he would do actually get done. Coach and conscience, not strategist.
+- Invoke with `/pa` (command at ~/.claude/commands/pa.md), or the natural triggers: "nudge me", "what's on my list", "what should I do", "add this to my to-do", "remind me to X", "add this action", "did I do X", "done X", "push X", "drop X", "review my list", or any free-form brain-dump of things to remember to do.
+- Always use ~/bin/skills/personal-assistant/SKILL.md; authoritative instructions ~/bin/prompts/personal-assistant.md (read fresh each run).
+- Single source of truth = the task bank `~/brain/tasks/pa-task-bank.md` (Eisenhower-quadranted). Read and write it every run; never invent or silently drop a task.
+- Four modes: CAPTURE (parse a dump into quadranted tasks, confirm back), NUDGE (surface overdue -> today's Q1 -> Q2 -> quick Q3, capped ~5, phrased as accountability, one closing question), UPDATE (flip statuses), TRIAGE (weekly re-quadrant, clear Done, force drops, keep < ~30 open).
+- Programme path (Marcus's ask, build up the ladder on request): Phase 1 chat skill (live) -> Phase 2 `~/bin/pa` CLI pre-loaded with the bank -> Phase 3 scheduled morning/midday/evening nudges via cron/loop to terminal, macOS notification, or Telegram -> Phase 4 two-way voice via the Wispr path.
+- Default model Sonnet (capture/nudge/update); frontier for weekly triage or a large brain-dump parse. Ledger: ~/brain/.tasks/skill-evolution/personal-assistant/ledger.jsonl
