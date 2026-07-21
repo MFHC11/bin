@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,15 +237,25 @@ def _extract_json(s: str) -> dict:
 
 def claude_call(prompt: str, model: str, allow_read: bool) -> str:
     env = dict(os.environ)
-    env.pop("ANTHROPIC_API_KEY", None)  # use Max-plan OAuth
+    env.pop("ANTHROPIC_API_KEY", None)  # use Max-plan OAuth, never the unfunded console key
     cmd = ["claude", "--print", "--model", model, "--permission-mode", "bypassPermissions"]
     if allow_read:
         cmd += ["--allowedTools", "Read"]
-    proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                          env=env, cwd=str(HOME))
-    if proc.returncode != 0:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:300]}")
-    return proc.stdout
+    # Retry with backoff: the detached-cron vision run has shown transient exit-1s
+    # (rate/contention) that clear on a re-run. Surface BOTH streams on failure —
+    # claude frequently writes the real error to stdout, not stderr, so the old
+    # stderr-only message logged an empty "claude exited 1:" that hid the cause.
+    last_err = "claude call failed"
+    for attempt in range(3):
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              env=env, cwd=str(HOME))
+        if proc.returncode == 0:
+            return proc.stdout
+        detail = (proc.stderr.strip() or proc.stdout.strip() or "(no output on either stream)")[:400]
+        last_err = f"claude exited {proc.returncode}: {detail}"
+        if attempt < 2:
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(last_err)
 
 
 def vision_extract(image_path: str, page_text: str, page_no: int, total: int, model: str) -> dict:

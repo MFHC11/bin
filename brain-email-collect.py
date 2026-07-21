@@ -21,7 +21,9 @@ import email.utils
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -38,11 +40,58 @@ MAX_MESSAGES = 200  # per-call cap; collector loops if more pages exist
 # long emails were being truncated before enrichment ever saw them.
 BODY_CHARS = 10_000
 
-# Attachment download policy: only document types worth converting, and only
-# below a sanity cap. Inline signature images etc. are listed but never fetched.
-# Downloads go straight into ~/brain/inbox/ where brain-pdf-worker drains *.pdf.
-DOWNLOAD_MIMES = {"application/pdf"}
+# Attachment download policy. PDFs pass straight through. Office decks and images
+# are downloaded and converted to PDF (via LibreOffice headless) so decks and
+# image-heavy files feed the pdf-to-brain vision pipeline instead of being
+# silently dropped. Everything lands as a *.pdf in ~/brain/inbox/ for the worker.
+PDF_MIMES = {"application/pdf"}
+OFFICE_MIMES = {
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # .pptx
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",     # .docx
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",           # .xlsx
+    "application/vnd.ms-powerpoint",   # .ppt
+    "application/msword",              # .doc
+    "application/vnd.ms-excel",        # .xls
+}
+IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif",
+               "image/webp", "image/tiff", "image/bmp"}
+CONVERT_MIMES = OFFICE_MIMES | IMAGE_MIMES
+DOWNLOAD_MIMES = PDF_MIMES | CONVERT_MIMES
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+SOFFICE = "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+
+
+def _convert_to_pdf(raw: bytes, filename: str, dest: Path) -> bool:
+    """Convert non-PDF attachment bytes (office doc or image) to a PDF at `dest`
+    via LibreOffice headless. Returns True on success. Requires soffice; an
+    isolated -env:UserInstallation profile avoids the single-profile lock so
+    cron/back-to-back runs don't collide."""
+    if not os.path.exists(SOFFICE):
+        print(f"[email-collect] cannot convert {filename!r}: LibreOffice (soffice) not installed",
+              file=sys.stderr)
+        return False
+    ext = Path(filename).suffix or ".bin"
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / ("in" + ext)
+        src.write_bytes(raw)
+        try:
+            proc = subprocess.run(
+                [SOFFICE, "--headless", f"-env:UserInstallation=file://{td}/lo",
+                 "--convert-to", "pdf", "--outdir", td, str(src)],
+                capture_output=True, text=True, timeout=180,
+            )
+        except Exception as e:
+            print(f"[email-collect] soffice error for {filename!r}: {e}", file=sys.stderr)
+            return False
+        out_pdf = Path(td) / "in.pdf"
+        if proc.returncode != 0 or not out_pdf.exists():
+            detail = (proc.stderr or proc.stdout or "").strip()[:200]
+            print(f"[email-collect] soffice rc={proc.returncode} for {filename!r}: {detail}",
+                  file=sys.stderr)
+            return False
+        dest.write_bytes(out_pdf.read_bytes())
+        return True
 
 # Set True after the first SCOPE_MISMATCH so one run never spams ClawVisor
 # with doomed download requests. get_attachment requires a standing-task
@@ -471,15 +520,19 @@ def download_attachments(rec: dict) -> int:
             print(f"[email-collect] b64 decode failed for {att['filename']!r}: {e}",
                   file=sys.stderr)
             continue
-        if not raw.startswith(b"%PDF"):
-            print(f"[email-collect] skipped {att['filename']!r}: payload is not a PDF "
-                  f"(header {raw[:8]!r})", file=sys.stderr)
+        if raw.startswith(b"%PDF"):
+            dest.write_bytes(raw)
+        elif att["mime_type"] in CONVERT_MIMES:
+            if not _convert_to_pdf(raw, att["filename"], dest):
+                continue  # conversion failed; leave metadata-only listing, try next
+        else:
+            print(f"[email-collect] skipped {att['filename']!r}: not a PDF and not a "
+                  f"convertible type (mime {att['mime_type']}, header {raw[:8]!r})",
+                  file=sys.stderr)
             continue
-        dest.write_bytes(raw)
         att["saved_as"] = dest.name
         saved += 1
-        print(f"[email-collect] saved attachment → inbox/{dest.name} "
-              f"({len(raw)} bytes)", file=sys.stderr)
+        print(f"[email-collect] saved attachment → inbox/{dest.name}", file=sys.stderr)
     return saved
 
 

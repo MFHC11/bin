@@ -17,6 +17,12 @@
 set -u
 export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin"
 
+# Route Max-plan auth: load the OAuth token (so a bare-shell manual run also
+# authenticates) then drop the unfunded console key that secrets.env re-exports.
+# pdf-to-brain re-scrubs ANTHROPIC_API_KEY per call too; this is belt-and-braces.
+[ -f "$HOME/.gbrain/secrets.env" ] && . "$HOME/.gbrain/secrets.env" 2>/dev/null || true
+unset ANTHROPIC_API_KEY
+
 INBOX="$HOME/brain/inbox"
 LOGDIR="$HOME/.gbrain/cron"; mkdir -p "$LOGDIR"
 LOG="$LOGDIR/pdf-to-brain-$(date -u +%Y-%m-%d).log"
@@ -36,7 +42,7 @@ rc=0
 for pdf in "${pdfs[@]}"; do
     [ -f "$pdf" ] || continue
     echo "[$(ts)] → $(basename "$pdf")" >> "$LOG"
-    if "$HOME/bin/pdf-to-brain" "$pdf" >> "$LOG" 2>&1; then
+    if "$HOME/bin/pdf-to-brain" --concurrency 1 "$pdf" >> "$LOG" 2>&1; then
         echo "[$(ts)]   ✓ done" >> "$LOG"
     else
         echo "[$(ts)]   ✗ failed (rc=$?) — left in inbox for next run" >> "$LOG"
